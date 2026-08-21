@@ -17,6 +17,7 @@ Three defences live here:
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import re
 import socket
@@ -44,6 +45,8 @@ _BLOCKED_NETWORKS = [
     ipaddress.ip_network("fe80::/10"),  # link-local
 ]
 
+_ALLOWED_PORTS = {80, 443}
+
 _MAX_REDIRECTS = 3
 _MAX_BYTES = 2_000_000
 _TIMEOUT_SECONDS = 12
@@ -69,11 +72,22 @@ class FetchResult:
     truncated: bool
 
 
+def _ip_is_forbidden(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if not addr.is_global:
+        return True
+    return any(addr.version == network.version and addr in network for network in _BLOCKED_NETWORKS)
+
+
 def _assert_public_ip(hostname: str) -> None:
     """Resolve a hostname and reject it if any address is non-public.
 
-    Every resolved address is checked, not just the first: a hostname with both
-    a public and a private A record would otherwise slip through.
+    This is a fast, cheap pre-filter that rejects obviously-bad hosts before a
+    socket is ever opened. It is NOT the security boundary: a DNS answer here
+    is not what the connection actually reaches. ``_assert_public_peer`` below,
+    which checks the live connected socket, is the authoritative check —
+    naive validate-then-fetch is a known TOCTOU (DNS-rebinding lets a hostile
+    server answer "public" for this lookup and a private/metadata address for
+    the real connection moments later).
     """
     try:
         infos = socket.getaddrinfo(hostname, None)
@@ -90,11 +104,38 @@ def _assert_public_ip(hostname: str) -> None:
         except ValueError:
             raise UnsafeURLError(f"unparseable address for {hostname}: {raw}")
 
-        for network in _BLOCKED_NETWORKS:
-            if addr.version == network.version and addr in network:
-                raise UnsafeURLError(
-                    f"host {hostname} resolves to blocked address {addr}"
-                )
+        if _ip_is_forbidden(addr):
+            raise UnsafeURLError(
+                f"host {hostname} resolves to blocked address {addr}"
+            )
+
+
+def _assert_public_peer(sock: socket.socket) -> None:
+    """Validate the IP the socket actually connected to.
+
+    Called after the TCP handshake completes and before any bytes are sent or
+    TLS is negotiated. This is what closes the DNS-rebinding gap: whatever
+    ``_assert_public_ip`` saw earlier, this is the address traffic will
+    actually flow to.
+    """
+    try:
+        peer_ip = sock.getpeername()[0]
+    except OSError as exc:
+        sock.close()
+        raise UnsafeURLError(f"could not determine peer address: {exc}") from exc
+
+    try:
+        addr = ipaddress.ip_address(peer_ip)
+    except ValueError as exc:
+        sock.close()
+        raise UnsafeURLError(f"invalid peer address {peer_ip!r}") from exc
+
+    if _ip_is_forbidden(addr):
+        sock.close()
+        raise UnsafeURLError(
+            f"blocked: connected peer {addr} is not a public address "
+            "(possible DNS rebinding)"
+        )
 
 
 def assert_safe_url(url: str) -> str:
@@ -102,7 +143,9 @@ def assert_safe_url(url: str) -> str:
 
     Returns the URL unchanged when safe; raises ``UnsafeURLError`` otherwise.
     Called before every request, including each redirect hop, because DNS can
-    change between checks and a redirect can point somewhere new.
+    change between checks and a redirect can point somewhere new. This is the
+    fast pre-filter described in ``_assert_public_ip``; the actual fetch in
+    ``safe_fetch`` additionally validates the live connected socket.
     """
     parsed = urlparse(url)
 
@@ -112,12 +155,68 @@ def assert_safe_url(url: str) -> str:
     if not parsed.hostname:
         raise UnsafeURLError("URL has no hostname")
 
+    if parsed.username or parsed.password:
+        raise UnsafeURLError("credentials in URL are not allowed")
+
     # Non-standard ports are a common way to reach internal services.
-    if parsed.port is not None and parsed.port not in (80, 443):
+    if parsed.port is not None and parsed.port not in _ALLOWED_PORTS:
         raise UnsafeURLError(f"port not allowed: {parsed.port}")
 
     _assert_public_ip(parsed.hostname)
     return url
+
+
+class _PeerValidatingHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection that checks the live socket's peer before use."""
+
+    def connect(self) -> None:
+        self.sock = self._create_connection(
+            (self.host, self.port), self.timeout, self.source_address
+        )
+        if self._tunnel_host:
+            self._tunnel()
+        _assert_public_peer(self.sock)
+
+
+class _PeerValidatingHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection that checks the live socket's peer before the TLS handshake.
+
+    The check happens between the raw TCP connect and the SSL wrap, mirroring
+    ``http.client.HTTPSConnection.connect`` internally, so a rebinding attempt
+    is caught before any TLS bytes — let alone the request — are sent.
+    """
+
+    def connect(self) -> None:
+        sock = self._create_connection(
+            (self.host, self.port), self.timeout, self.source_address
+        )
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+            sock = self.sock
+
+        _assert_public_peer(sock)
+
+        # HTTPSConnection.__init__ already resolves self._context to a real
+        # SSLContext (defaulting via ssl.create_default_context()) even when
+        # the caller passes context=None, so it is never None here.
+        server_hostname = self._tunnel_host or self.host
+        self.sock = self._context.wrap_socket(sock, server_hostname=server_hostname)
+
+
+class _GuardedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):  # noqa: D102
+        return self.do_open(_PeerValidatingHTTPConnection, req)
+
+
+class _GuardedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):  # noqa: D102
+        return self.do_open(
+            _PeerValidatingHTTPSConnection,
+            req,
+            context=self._context,
+            check_hostname=self._check_hostname,
+        )
 
 
 def safe_fetch(url: str) -> FetchResult:
@@ -138,29 +237,34 @@ def safe_fetch(url: str) -> FetchResult:
             method="GET",
         )
 
-        opener = urllib.request.build_opener(_NoRedirect)
+        opener = urllib.request.build_opener(
+            _NoRedirect, _GuardedHTTPHandler, _GuardedHTTPSHandler
+        )
         try:
             with opener.open(request, timeout=_TIMEOUT_SECONDS) as response:
-                status = response.status
-                if status in (301, 302, 303, 307, 308):
-                    location = response.headers.get("Location")
-                    if not location:
-                        raise UnsafeURLError("redirect without Location header")
-                    current = assert_safe_url(urllib.parse.urljoin(current, location))
-                    continue
-
                 raw = response.read(_MAX_BYTES + 1)
                 truncated = len(raw) > _MAX_BYTES
                 text = raw[:_MAX_BYTES].decode("utf-8", errors="replace")
                 return FetchResult(
                     url=seen[0],
                     final_url=current,
-                    status=status,
+                    status=response.status,
                     text=_strip_markup(text),
                     truncated=truncated,
                 )
         except urllib.error.HTTPError as exc:
-            # A 4xx/5xx is a real answer about the source, not a crash.
+            # With redirects disabled via _NoRedirect, urllib raises HTTPError
+            # for 3xx responses too rather than returning them normally — a
+            # redirect is therefore caught here, not inside the try block
+            # above. Only a genuine 4xx/5xx is a terminal answer about the
+            # source; a 3xx still needs one more hop.
+            if exc.code in (301, 302, 303, 307, 308):
+                location = exc.headers.get("Location") if exc.headers else None
+                if not location:
+                    raise UnsafeURLError("redirect without Location header") from exc
+                current = assert_safe_url(urllib.parse.urljoin(current, location))
+                continue
+
             return FetchResult(
                 url=seen[0],
                 final_url=current,

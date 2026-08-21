@@ -24,3 +24,6 @@ Dockerfile.bedrock_agentcore
 # Local run output
 runs/
 *.log
+
+# Scratch research notes — not part of the submission
+research_dump/

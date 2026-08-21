@@ -9,12 +9,33 @@ from __future__ import annotations
 import socket
 import unittest
 
+import http.server
+import threading
+from unittest import mock
+
+from smishsentinel import safety
 from smishsentinel.safety import (
     UnsafeURLError,
+    _assert_public_peer,
     assert_safe_url,
     redact_for_search,
+    safe_fetch,
     wrap_untrusted,
 )
+
+
+class _FakeSocket:
+    """Enough of a socket to exercise ``_assert_public_peer`` without a network."""
+
+    def __init__(self, peer_ip: str) -> None:
+        self._peer_ip = peer_ip
+        self.closed = False
+
+    def getpeername(self):
+        return (self._peer_ip, 443)
+
+    def close(self):
+        self.closed = True
 
 
 class TestSSRFGuards(unittest.TestCase):
@@ -70,6 +91,110 @@ class TestSSRFGuards(unittest.TestCase):
     def test_rejects_url_without_hostname(self) -> None:
         with self.assertRaises(UnsafeURLError):
             assert_safe_url("https:///nohost")
+
+
+class TestPeerValidation(unittest.TestCase):
+    """The authoritative check: the socket actually connected to, not DNS.
+
+    ``assert_safe_url`` alone is a TOCTOU trap — a hostile DNS server can
+    answer differently for the pre-check than for the real connection moments
+    later. These tests exercise ``_assert_public_peer`` directly, which is
+    what closes that gap by checking the live socket instead of a prior
+    lookup.
+    """
+
+    def test_rejects_metadata_endpoint_as_connected_peer(self) -> None:
+        """The DNS-rebinding scenario: whatever the pre-check saw, the
+        connection actually landed on the cloud metadata address."""
+        sock = _FakeSocket("169.254.169.254")
+        with self.assertRaises(UnsafeURLError):
+            _assert_public_peer(sock)
+        self.assertTrue(sock.closed, "a rejected socket must be closed")
+
+    def test_rejects_private_peer(self) -> None:
+        sock = _FakeSocket("10.0.0.5")
+        with self.assertRaises(UnsafeURLError):
+            _assert_public_peer(sock)
+        self.assertTrue(sock.closed)
+
+    def test_accepts_public_peer(self) -> None:
+        sock = _FakeSocket("93.184.216.34")  # example.com's real public IP
+        _assert_public_peer(sock)  # must not raise
+        self.assertFalse(sock.closed)
+
+    def test_rejects_ipv6_loopback_peer(self) -> None:
+        sock = _FakeSocket("::1")
+        with self.assertRaises(UnsafeURLError):
+            _assert_public_peer(sock)
+
+
+class _OneShotHandler(http.server.BaseHTTPRequestHandler):
+    """A tiny local server, just to prove the guarded connection classes
+    actually complete a real HTTP request rather than only rejecting bad
+    ones. Serves a fixed body on GET, or a redirect if the path is /redirect.
+    """
+
+    def log_message(self, *args):  # silence per-request logging
+        pass
+
+    def do_GET(self):  # noqa: N802
+        if self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", "/final")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"hello from loopback")
+
+
+class TestGuardedConnectionWiring(unittest.TestCase):
+    """Proves the custom HTTPConnection/handler wiring in safe_fetch actually
+    completes a normal request, not just that it rejects bad ones.
+
+    localhost is deliberately in the SSRF blocklist for real use, so this
+    test patches ``_ip_is_forbidden`` to allow loopback for its duration only
+    — that's a test artifact to reach a local server, not a change to the
+    real policy, which the SSRF-guard tests above continue to verify.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = http.server.HTTPServer(("127.0.0.1", 0), _OneShotHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.thread.join(timeout=5)
+
+    def test_guarded_connection_completes_a_real_request(self) -> None:
+        with (
+            mock.patch.object(safety, "_ip_is_forbidden", return_value=False),
+            mock.patch.object(safety, "_ALLOWED_PORTS", {self.port}),
+        ):
+            result = safe_fetch(f"http://127.0.0.1:{self.port}/")
+        self.assertEqual(result.status, 200)
+        self.assertIn("hello from loopback", result.text)
+
+    def test_guarded_connection_follows_and_revalidates_a_redirect(self) -> None:
+        with (
+            mock.patch.object(safety, "_ip_is_forbidden", return_value=False),
+            mock.patch.object(safety, "_ALLOWED_PORTS", {self.port}),
+        ):
+            result = safe_fetch(f"http://127.0.0.1:{self.port}/redirect")
+        self.assertEqual(result.status, 200)
+        self.assertTrue(result.final_url.endswith("/final"))
+        self.assertIn("hello from loopback", result.text)
+
+    def test_loopback_is_still_blocked_without_the_test_patch(self) -> None:
+        """Sanity check that the patch above is doing something, not masking
+        a policy that was already broken."""
+        with self.assertRaises(UnsafeURLError):
+            safe_fetch(f"http://127.0.0.1:{self.port}/")
 
 
 class TestPromptInjectionWrapper(unittest.TestCase):
