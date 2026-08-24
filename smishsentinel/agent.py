@@ -36,6 +36,7 @@ from .schemas import ClaimSet, EvidenceCard, TriageResult, Verdict
 from .tools.evidence import (
     compare_hostname_to_domain,
     current_context,
+    evidence_dump,
     fetch_official_page,
     report_fetch_ledger,
     reset_context,
@@ -134,15 +135,26 @@ _SYNTHESIS_PROMPT = (
     _SHARED_STANCE
     + """
 You are the synthesis stage. You produce the evidence card the user reads. You \
-have no tools: reason only over the investigation notes you are given. If you \
-find yourself wanting one more page, that absence is itself the finding — \
-report it as unresolved.
+have no tools: reason only over what you are given. If you find yourself \
+wanting one more page, that absence is itself the finding — report it as \
+unresolved.
+
+You are given two different things about each retrieved page, and they are not \
+interchangeable. The investigator's notes are its own narrative summary — \
+useful for context, but never a source of quotes, because a summary of a page \
+is not the page. The retrieved page text is the actual content that was \
+fetched. Every quoted_text field and every evidence-backed claim must draw \
+from the retrieved page text, never from the notes. If the retrieved text for \
+an evidence ID is thin or absent even though the ledger lists it, that ID \
+cannot support a verified fact — treat the claim as not_addressed instead of \
+inferring what the page probably said from the notes' paraphrase of it.
 
 Keep four layers strictly separate:
   - observed_behaviour: what the message itself does. Never a claim about the world.
-  - verified_facts: statements a retrieved page actually supports. Each must \
-cite an evidence ID inline, like "(E2)". If you cannot cite one, it is not a \
-verified fact.
+  - verified_facts: statements the retrieved page TEXT actually supports. Each \
+must cite an evidence ID inline, like "(E2)", and that citation must be \
+traceable to a real excerpt in the retrieved page text. If you cannot point to \
+the actual text, it is not a verified fact.
   - inferences: what you conclude from those facts. Reasonable, but not verified.
   - unresolved: what you could not establish, and why that matters.
 
@@ -353,11 +365,14 @@ ORIGINAL MESSAGE:
 CLAIMS EXAMINED:
 {claim_lines}
 
-INVESTIGATION NOTES:
+INVESTIGATOR'S NOTES (its own summary — use for context, not for quotes):
 {investigation}
 
-PAGES ACTUALLY RETRIEVED (only these evidence IDs exist):
-{report_fetch_ledger()}""",
+FETCH LEDGER (only these evidence IDs exist; anything else is fabricated):
+{report_fetch_ledger()}
+
+ACTUAL RETRIEVED PAGE TEXT (quote from here, never from the notes above):
+{evidence_dump()}""",
         structured_output_model=EvidenceCard,
         limits=SYNTHESIS_BUDGET.as_limits(),
     )

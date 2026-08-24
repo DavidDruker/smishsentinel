@@ -32,11 +32,18 @@ class CaseContext:
 
     fetches_used: int = 0
     fetch_log: list[dict[str, str]] = field(default_factory=list)
+    # Retrieved page text, keyed by evidence_id. Kept out of fetch_log (and
+    # therefore out of report_fetch_ledger's normal listing) because the
+    # investigator agent only needs to know an ID exists there; the synthesist
+    # needs the actual text, pulled in separately via evidence_dump() so the
+    # model is never left constructing a quote from its own paraphrase of
+    # what a page said.
+    evidence_text: dict[str, str] = field(default_factory=dict)
 
     def remaining(self) -> int:
         return max(0, MAX_FETCHES_PER_CASE - self.fetches_used)
 
-    def record(self, url: str, final_url: str, status: int) -> str:
+    def record(self, url: str, final_url: str, status: int, text: str = "") -> str:
         self.fetches_used += 1
         evidence_id = f"E{self.fetches_used}"
         self.fetch_log.append(
@@ -48,6 +55,8 @@ class CaseContext:
                 "retrieved_at": _dt.datetime.now(_dt.UTC).isoformat(),
             }
         )
+        if text:
+            self.evidence_text[evidence_id] = text
         return evidence_id
 
     def retrieved_urls(self) -> set[str]:
@@ -122,8 +131,8 @@ def fetch_official_page(url: str) -> str:
         context.record(url, result.final_url, result.status)
         return "FETCH_EMPTY: the page returned no readable text."
 
-    evidence_id = context.record(url, result.final_url, result.status)
     body = result.text[:6000]
+    evidence_id = context.record(url, result.final_url, result.status, text=body)
     return (
         f"EVIDENCE_ID={evidence_id} FINAL_URL={result.final_url}\n"
         + wrap_untrusted(body, source=result.final_url)
@@ -215,3 +224,28 @@ def report_fetch_ledger() -> str:
     ]
     lines.append(f"Fetches remaining: {context.remaining()}")
     return "\n".join(lines)
+
+
+def evidence_dump() -> str:
+    """Render every successfully-retrieved page's actual text for synthesis.
+
+    Not a tool — the investigator never calls this. It exists because the
+    synthesist otherwise only sees the investigator's own natural-language
+    summary of what a page said, and a summary is not a quote. Handing the
+    synthesist the real retrieved text directly means a cited "quoted_text"
+    can be an actual excerpt rather than the model's paraphrase of its own
+    earlier paraphrase.
+    """
+    context = current_context()
+    if not context.evidence_text:
+        return "No page text was successfully retrieved in this investigation."
+
+    sections = []
+    for entry in context.fetch_log:
+        text = context.evidence_text.get(entry["evidence_id"])
+        if text is None:
+            continue
+        sections.append(
+            f"--- {entry['evidence_id']} ({entry['final_url']}) ---\n{text}"
+        )
+    return "\n\n".join(sections)

@@ -20,7 +20,7 @@ from smishsentinel.schemas import (
     RiskLevel,
     Verdict,
 )
-from smishsentinel.tools.evidence import current_context, reset_context
+from smishsentinel.tools.evidence import current_context, evidence_dump, reset_context
 
 
 def _card(**overrides) -> EvidenceCard:
@@ -148,6 +148,41 @@ class TestFetchBudget(unittest.TestCase):
 
         reset_context()
         self.assertEqual(len(current_context().fetch_log), 0)
+
+
+class TestEvidenceDump(unittest.TestCase):
+    """evidence_dump() is what lets synthesis quote real page text instead of
+    the investigator's paraphrase of it — see the regression this guards
+    against in agent.py's module docstring / commit history: a live run
+    correctly refused to fabricate a quote because the synthesist had never
+    been given anything to quote from.
+    """
+
+    def test_empty_context_says_so_plainly(self) -> None:
+        reset_context()
+        self.assertIn("No page text", evidence_dump())
+
+    def test_dump_includes_the_actual_retrieved_text(self) -> None:
+        context = reset_context()
+        eid = context.record(
+            "https://canadapost.ca/security",
+            "https://canadapost.ca/security",
+            200,
+            text="We will never ask you to pay a redelivery fee by text message.",
+        )
+        dump = evidence_dump()
+        self.assertIn(eid, dump)
+        self.assertIn("canadapost.ca/security", dump)
+        self.assertIn("never ask you to pay a redelivery fee", dump)
+
+    def test_records_without_text_are_omitted_not_fabricated(self) -> None:
+        """A 404 or empty-body fetch is recorded (it consumed budget) but has
+        no text — the dump must not paper over that with a placeholder a
+        model could mistake for real content."""
+        context = reset_context()
+        context.record("https://canadapost.ca/gone", "https://canadapost.ca/gone", 404)
+        dump = evidence_dump()
+        self.assertNotIn("canadapost.ca/gone", dump)
 
 
 class TestSchemaInvariants(unittest.TestCase):
