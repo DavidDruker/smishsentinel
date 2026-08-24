@@ -1,0 +1,4 @@
+bedrock-agentcore>=1.6.3
+strands-agents
+boto3
+pydantic

@@ -10,7 +10,12 @@ import socket
 import unittest
 
 import http.server
+import shutil
+import ssl
+import subprocess
+import tempfile
 import threading
+from pathlib import Path
 from unittest import mock
 
 from smishsentinel import safety
@@ -195,6 +200,79 @@ class TestGuardedConnectionWiring(unittest.TestCase):
         a policy that was already broken."""
         with self.assertRaises(UnsafeURLError):
             safe_fetch(f"http://127.0.0.1:{self.port}/")
+
+
+class TestGuardedHTTPSConnectionWiring(unittest.TestCase):
+    """Proves _PeerValidatingHTTPSConnection actually completes a TLS request.
+
+    This exists because of a real bug: _GuardedHTTPSHandler referenced a
+    urllib internal attribute (``self._check_hostname``) that does not exist
+    on this Python version's HTTPSHandler, so every HTTPS fetch raised
+    AttributeError -- while the HTTP-only wiring test above kept passing,
+    masking it completely. Since HTTPS is what virtually every real fetch
+    target actually uses, that bug would have silently disabled the entire
+    evidence-gathering feature outside of tests. Skips itself (rather than
+    failing the suite) if openssl isn't available to mint a throwaway cert.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if shutil.which("openssl") is None:
+            raise unittest.SkipTest("openssl not available to generate a test cert")
+
+        cls.tmpdir = tempfile.mkdtemp(prefix="smish_https_test_")
+        cls.certfile = str(Path(cls.tmpdir) / "cert.pem")
+        cls.keyfile = str(Path(cls.tmpdir) / "key.pem")
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                "-days", "1", "-nodes",
+                "-keyout", cls.keyfile, "-out", cls.certfile,
+                "-subj", "/CN=127.0.0.1",
+            ],
+            check=True, capture_output=True,
+        )
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=cls.certfile, keyfile=cls.keyfile)
+
+        cls.server = http.server.HTTPServer(("127.0.0.1", 0), _OneShotHandler)
+        cls.server.socket = context.wrap_socket(cls.server.socket, server_side=True)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if hasattr(cls, "server"):
+            cls.server.shutdown()
+            cls.thread.join(timeout=5)
+        if hasattr(cls, "tmpdir"):
+            shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_guarded_https_connection_completes_a_real_tls_request(self) -> None:
+        # The self-signed cert is untrusted by design, so also patch ssl
+        # verification off for this test — separate from, and not a
+        # substitute for, the peer-IP check under test.
+        with (
+            mock.patch.object(safety, "_ip_is_forbidden", return_value=False),
+            mock.patch.object(safety, "_ALLOWED_PORTS", {self.port}),
+            mock.patch(
+                "http.client._create_https_context",
+                return_value=_permissive_ssl_context(),
+            ),
+        ):
+            result = safe_fetch(f"https://127.0.0.1:{self.port}/")
+        self.assertEqual(result.status, 200)
+        self.assertIn("hello from loopback", result.text)
+
+
+def _permissive_ssl_context() -> ssl.SSLContext:
+    """An SSLContext that accepts the test's self-signed certificate."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
 
 
 class TestPromptInjectionWrapper(unittest.TestCase):

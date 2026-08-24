@@ -211,12 +211,10 @@ class _GuardedHTTPHandler(urllib.request.HTTPHandler):
 
 class _GuardedHTTPSHandler(urllib.request.HTTPSHandler):
     def https_open(self, req):  # noqa: D102
-        return self.do_open(
-            _PeerValidatingHTTPSConnection,
-            req,
-            context=self._context,
-            check_hostname=self._check_hostname,
-        )
+        # HTTPSHandler.__init__ folds check_hostname into self._context itself
+        # (context.check_hostname = ...) rather than keeping a separate
+        # attribute, so only context needs forwarding here.
+        return self.do_open(_PeerValidatingHTTPSConnection, req, context=self._context)
 
 
 def safe_fetch(url: str) -> FetchResult:

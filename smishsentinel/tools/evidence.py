@@ -104,8 +104,10 @@ def fetch_official_page(url: str) -> str:
     try:
         result = safe_fetch(url)
     except UnsafeURLError as exc:
+        print(f"[fetch_official_page] REFUSED url={url!r} reason={exc}")
         return f"FETCH_REFUSED: {exc}"
     except Exception as exc:  # noqa: BLE001 - surface as evidence, never crash the run
+        print(f"[fetch_official_page] FAILED url={url!r} {type(exc).__name__}: {exc}")
         return f"FETCH_FAILED: {type(exc).__name__}: {exc}"
 
     if result.status >= 400:

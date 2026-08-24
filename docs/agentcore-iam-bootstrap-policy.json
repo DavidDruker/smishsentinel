@@ -1,0 +1,45 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AgentCoreIAMRoleManagement",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:TagRole",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies"
+      ],
+      "Resource": [
+        "arn:aws:iam::YOUR_ACCOUNT_ID:role/*BedrockAgentCore*",
+        "arn:aws:iam::YOUR_ACCOUNT_ID:role/service-role/*BedrockAgentCore*"
+      ]
+    },
+    {
+      "Sid": "AgentCoreIAMPassRole",
+      "Effect": "Allow",
+      "Action": ["iam:PassRole"],
+      "Resource": [
+        "arn:aws:iam::YOUR_ACCOUNT_ID:role/AmazonBedrockAgentCore*",
+        "arn:aws:iam::YOUR_ACCOUNT_ID:role/service-role/AmazonBedrockAgentCore*"
+      ]
+    },
+    {
+      "Sid": "AgentCoreServiceLinkedRole",
+      "Effect": "Allow",
+      "Action": "iam:CreateServiceLinkedRole",
+      "Resource": "arn:aws:iam::YOUR_ACCOUNT_ID:role/aws-service-role/runtime-identity.bedrock-agentcore.amazonaws.com/AWSServiceRoleForBedrockAgentCoreRuntimeIdentity",
+      "Condition": {
+        "StringEquals": {
+          "iam:AWSServiceName": "runtime-identity.bedrock-agentcore.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
