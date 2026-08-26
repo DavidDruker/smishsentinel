@@ -164,9 +164,7 @@ smishsentinel/
   inbox.py                      The synthetic inbox trigger and end-to-end orchestration
   tools/evidence.py             Fetch, hostname comparison, and the domain-lock enforcement
 tests/                          76 tests; everything except the live-only smoke test runs offline
-ARCHITECTURE.md                 Diagram and the reasoning behind the agent/tool split
-EVALUATION.md                   What was actually tested and how, including live-deployment results
-DISCLOSURES.md                  Prior-work disclosure and hackathon-rules compliance notes
+ARCHITECTURE.md                 Diagrams and the reasoning behind the agent/tool split
 docs/agentcore-iam-bootstrap-policy.json   The IAM policy AgentCore's auto-role-creation needs
 ```
 
@@ -189,8 +187,7 @@ Stated plainly rather than left for a judge to discover:
   both.
 - No adversarial or prompt-injection red-teaming beyond the specific,
   disclosed defenses in the code (SSRF peer-IP validation, CoreBreak input
-  validation, untrusted-content wrapping). See `EVALUATION.md` for what was
-  and wasn't tested.
+  validation, untrusted-content wrapping).
 
 ## License
 
