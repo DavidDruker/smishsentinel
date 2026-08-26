@@ -21,8 +21,11 @@ MODEL_HAIKU = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 # Until then these raise ResourceNotFoundException.
 MODEL_SONNET = "us.anthropic.claude-sonnet-4-6"
 
-# Triage runs on every message, so it uses the cheap model by default; the
-# reasoning-heavy stages prefer Sonnet and fall back when it is unavailable.
+# Both default to Haiku: Sonnet requires the Anthropic use-case form above
+# and isn't universally available yet. Set SMISH_REASONING_MODEL=MODEL_SONNET's
+# value once it's enabled on your account -- there is no automatic fallback,
+# so pointing this at an unavailable model fails the call outright rather
+# than silently downgrading.
 TRIAGE_MODEL = os.environ.get("SMISH_TRIAGE_MODEL", MODEL_HAIKU)
 REASONING_MODEL = os.environ.get("SMISH_REASONING_MODEL", MODEL_HAIKU)
 
