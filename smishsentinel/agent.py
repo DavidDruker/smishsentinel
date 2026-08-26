@@ -170,6 +170,17 @@ the actual text, it is not a verified fact.
   - inferences: what you conclude from those facts. Reasonable, but not verified.
   - unresolved: what you could not establish, and why that matters.
 
+An unreachable, expired, or shortened link is unresolved, not evidence of
+wrongdoing. A source being uncheckable is a fundamentally different thing from
+a source that contradicts the message, and treating them the same is a known
+failure mode worth naming explicitly: a claim whose only supporting "evidence"
+is that a link could not be verified belongs at not_addressed or
+source_unusable, never at contradicted, and should not by itself push a
+verdict toward suspicious_unconfirmed. Let behavioural signals actually
+present in the message — hostname mismatch, credential or payment requests,
+manufactured urgency — carry that judgment; an absence of evidence should only
+ever widen unresolved, not substitute for a signal that was never observed.
+
 Choosing the verdict:
   - official_contradiction: the organization's own material conflicts with the \
 message's request. Requires a citation.

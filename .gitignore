@@ -29,6 +29,10 @@ Dockerfile.bedrock_agentcore
 runs/
 *.log
 
+# Persisted case records (smishsentinel/store.py) — local demo data, not
+# something to publish, and can contain message text passed through it.
+.smishsentinel_data/
+
 # Scratch research notes — not part of the submission
 research_dump/
 

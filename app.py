@@ -16,6 +16,9 @@ from pydantic import BaseModel, ValidationError, field_validator
 from starlette.exceptions import HTTPException
 
 from smishsentinel.agent import investigate
+from smishsentinel.inbox import run_inbox_cycle
+from smishsentinel.notify import verify_delivered
+from smishsentinel.store import CaseStore
 
 app = BedrockAgentCoreApp()
 
@@ -69,13 +72,44 @@ def _clean_validation_detail(exc: ValidationError) -> list[dict[str, object]]:
     ]
 
 
+def _run_inbox_demo() -> dict:
+    """The end-to-end action: synthetic inbox -> investigation -> persisted,
+    notified-or-suppressed, independently-verified outcome for each case.
+
+    ``verify_delivered`` re-reads each case from the store rather than
+    trusting the in-memory record ``run_inbox_cycle`` returns — the point is
+    to confirm the persisted state actually says what the pipeline claims,
+    not just that the pipeline claims it.
+    """
+    store = CaseStore()
+    records = run_inbox_cycle(store=store)
+    return {
+        "action": "run_inbox_cycle",
+        "cases": [
+            {
+                "case_id": r.case_id,
+                "status": r.status.value,
+                "investigated": r.triage is not None and r.triage.get("warrants_investigation", False),
+                "verdict": r.card["verdict"] if r.card else None,
+                "notification_channel": r.notification.channel.value if r.notification else None,
+                "verified_delivered": verify_delivered(store.get(r.case_id)),
+            }
+            for r in records
+        ],
+    }
+
+
 @app.entrypoint
 def invoke(payload: dict) -> dict:
     """AgentCore calls this with whatever JSON body the caller POSTed.
 
-    ``payload`` is caller-controlled and therefore untrusted: it is validated
-    into ``InvocationRequest`` before anything else happens, and only the
-    resulting plain string is ever handed to an agent.
+    Two shapes are accepted: ``{"action": "run_inbox_cycle"}`` runs the
+    end-to-end synthetic-inbox demo (see smishsentinel/inbox.py), and
+    everything else is validated as a single-message analysis request.
+    ``payload`` is caller-controlled and therefore untrusted either way: the
+    action check only matches one exact literal string, and the text path is
+    validated into ``InvocationRequest`` before anything else happens, so
+    only a resulting plain string is ever handed to an agent.
 
     Raising ``HTTPException`` (rather than returning an error dict) is what
     actually produces a real 4xx: this app's underlying framework only sets a
@@ -83,6 +117,9 @@ def invoke(payload: dict) -> dict:
     Response object directly — a plain returned dict always serializes as a
     200, whatever it contains.
     """
+    if isinstance(payload, dict) and payload.get("action") == "run_inbox_cycle":
+        return _run_inbox_demo()
+
     try:
         request = InvocationRequest.model_validate(payload)
     except ValidationError as exc:
