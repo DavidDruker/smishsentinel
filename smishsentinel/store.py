@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -88,7 +89,13 @@ class CaseStore:
     """A directory of one JSON file per case, keyed by case_id."""
 
     def __init__(self, base_dir: str | None = None) -> None:
-        self.base_dir = Path(base_dir or os.environ.get("SMISH_STORE_DIR", ".smishsentinel_data"))
+        # A relative default (e.g. ".smishsentinel_data") resolves against the
+        # process's cwd, which inside the deployed container is /app -- the
+        # application's own source directory, not writable at runtime. The
+        # system temp directory is reliably writable in every environment
+        # this actually runs in, local or containerized.
+        default_dir = str(Path(tempfile.gettempdir()) / "smishsentinel_data")
+        self.base_dir = Path(base_dir or os.environ.get("SMISH_STORE_DIR", default_dir))
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def _path(self, case_id: str) -> Path:
