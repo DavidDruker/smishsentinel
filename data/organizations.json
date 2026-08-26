@@ -1,0 +1,139 @@
+{
+  "_comment": "Curated organization -> official-domain registry. See smishsentinel/registry.py. known_pages are best-effort starting points for fetch_official_page, not a guarantee the path is current -- a stale or 404 known page degrades gracefully, the same as any other fetch failure in this pipeline (see agent.py's handling of unreachable links).",
+  "organizations": [
+    {
+      "canonical_name": "Canada Post",
+      "aliases": ["Canada Post Corporation", "Postes Canada", "CanadaPost"],
+      "domain": "canadapost-postescanada.ca",
+      "known_pages": {
+        "home": "https://www.canadapost-postescanada.ca/",
+        "security": "https://www.canadapost-postescanada.ca/cpc/en/support/articles/security-and-fraud-prevention.page"
+      }
+    },
+    {
+      "canonical_name": "Canada Revenue Agency",
+      "aliases": ["CRA", "Revenu Canada", "Canada Revenue"],
+      "domain": "canada.ca",
+      "known_pages": {
+        "home": "https://www.canada.ca/en/revenue-agency.html",
+        "scam-prevention": "https://www.canada.ca/en/revenue-agency/corporate/scam-prevention.html"
+      }
+    },
+    {
+      "canonical_name": "RBC Royal Bank",
+      "aliases": ["RBC", "Royal Bank of Canada", "Royal Bank"],
+      "domain": "rbc.com",
+      "known_pages": {
+        "home": "https://www.rbc.com/",
+        "fraud-prevention": "https://www.rbc.com/privacysecurity/ca/protect-yourself-from-fraud.html"
+      }
+    },
+    {
+      "canonical_name": "TD Bank",
+      "aliases": ["TD", "TD Canada Trust", "Toronto-Dominion Bank"],
+      "domain": "td.com",
+      "known_pages": {
+        "home": "https://www.td.com/",
+        "fraud-security": "https://www.td.com/ca/en/personal-banking/how-to/fraud-security"
+      }
+    },
+    {
+      "canonical_name": "Amazon",
+      "aliases": ["Amazon.com", "Amazon Inc"],
+      "domain": "amazon.com",
+      "known_pages": {
+        "home": "https://www.amazon.com/",
+        "report-scam": "https://www.amazon.com/reportascam"
+      }
+    },
+    {
+      "canonical_name": "UPS",
+      "aliases": ["United Parcel Service"],
+      "domain": "ups.com",
+      "known_pages": {
+        "home": "https://www.ups.com/",
+        "fraud-awareness": "https://www.ups.com/us/en/support/shipping-support/legal-terms-conditions/fraud-awareness.page"
+      }
+    },
+    {
+      "canonical_name": "FedEx",
+      "aliases": ["Federal Express"],
+      "domain": "fedex.com",
+      "known_pages": {
+        "home": "https://www.fedex.com/",
+        "fraud-awareness": "https://www.fedex.com/en-us/trust-center/fraud-awareness.html"
+      }
+    },
+    {
+      "canonical_name": "Purolator",
+      "aliases": ["Purolator Inc"],
+      "domain": "purolator.com",
+      "known_pages": {
+        "home": "https://www.purolator.com/"
+      }
+    },
+    {
+      "canonical_name": "Rogers",
+      "aliases": ["Rogers Communications", "Rogers Wireless"],
+      "domain": "rogers.com",
+      "known_pages": {
+        "home": "https://www.rogers.com/",
+        "fraud-prevention": "https://www.rogers.com/consumer/protect-yourself"
+      }
+    },
+    {
+      "canonical_name": "Bell Canada",
+      "aliases": ["Bell", "Bell Mobility"],
+      "domain": "bell.ca",
+      "known_pages": {
+        "home": "https://www.bell.ca/",
+        "fraud-prevention": "https://www.bell.ca/Support/Fraud_prevention"
+      }
+    },
+    {
+      "canonical_name": "Telus",
+      "aliases": ["TELUS Communications", "Telus Mobility"],
+      "domain": "telus.com",
+      "known_pages": {
+        "home": "https://www.telus.com/",
+        "fraud-prevention": "https://www.telus.com/en/support/article/fraud-prevention"
+      }
+    },
+    {
+      "canonical_name": "Interac",
+      "aliases": ["Interac e-Transfer", "Interac Corp"],
+      "domain": "interac.ca",
+      "known_pages": {
+        "home": "https://www.interac.ca/",
+        "fraud-prevention": "https://www.interac.ca/en/consumers/protect-yourself/fraud-prevention/"
+      }
+    },
+    {
+      "canonical_name": "PayPal",
+      "aliases": ["Pay Pal"],
+      "domain": "paypal.com",
+      "known_pages": {
+        "home": "https://www.paypal.com/",
+        "report-phishing": "https://www.paypal.com/us/security/report-a-security-issue-or-vulnerability"
+      }
+    },
+    {
+      "canonical_name": "Apple",
+      "aliases": ["Apple Inc", "Apple ID"],
+      "domain": "apple.com",
+      "known_pages": {
+        "home": "https://www.apple.com/",
+        "phishing": "https://support.apple.com/en-us/HT204759"
+      }
+    },
+    {
+      "canonical_name": "Microsoft",
+      "aliases": ["Microsoft Corporation", "MSFT"],
+      "domain": "microsoft.com",
+      "known_pages": {
+        "home": "https://www.microsoft.com/",
+        "report-phishing": "https://www.microsoft.com/en-us/safety/online-privacy/phishing.aspx"
+      }
+    }
+  ]
+}

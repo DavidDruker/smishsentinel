@@ -53,10 +53,18 @@ def deliver(record: CaseRecord, channel: NotificationChannel) -> NotificationRec
     """Carry out the decision and produce the record that proves it happened.
 
     The "delivery" itself is a log line plus the returned record -- see the
-    module docstring for why that is the honest scope of "delivered" here.
+    module docstring for why that is the honest scope of delivery here.
+    Suppression and delivery are recorded as the two different things they
+    are (see NotificationRecord): every call here completes the decision,
+    but only a real channel (STANDARD/URGENT) sets notification_delivered.
     """
     if channel == NotificationChannel.NONE:
-        notification = NotificationRecord(channel=channel, delivered=True, detail="suppressed")
+        notification = NotificationRecord(
+            channel=channel,
+            decision_recorded=True,
+            notification_delivered=False,
+            detail="suppressed",
+        )
         print(f"[notify] case={record.case_id} SUPPRESSED (no investigation warranted)")
         return notification
 
@@ -66,19 +74,43 @@ def deliver(record: CaseRecord, channel: NotificationChannel) -> NotificationRec
 
     return NotificationRecord(
         channel=channel,
-        delivered=True,
+        decision_recorded=True,
+        notification_delivered=True,
         delivered_at=datetime.now(UTC).isoformat(),
         detail=detail,
     )
 
 
 def verify_delivered(record: CaseRecord | None) -> bool:
-    """Ground truth for "did the user-facing action actually occur" -- reads
-    the persisted record rather than trusting an in-memory return value that
-    could reflect a step that ran but never actually got written down."""
+    """Ground truth for "did the notify/suppress decision actually get made
+    and persisted" -- reads the persisted record rather than trusting an
+    in-memory return value that could reflect a step that ran but never
+    actually got written down.
+
+    Deliberately checks decision_recorded, not notification_delivered: a
+    suppressed case is a complete, correct outcome too, and this function
+    answers "did the pipeline finish and record what it did," not "did a
+    notification get sent." Call verify_notification_sent for the latter.
+    """
     return (
         record is not None
         and record.status.value == "complete"
         and record.notification is not None
-        and record.notification.delivered
+        and record.notification.decision_recorded
+    )
+
+
+def verify_notification_sent(record: CaseRecord | None) -> bool:
+    """Whether a real notification (standard or urgent) actually went out.
+
+    False for a suppressed case by design -- suppression means nothing was
+    sent, not that delivery failed. Use this when the question is
+    specifically "did the user get told something," not "did the pipeline
+    finish" (that's verify_delivered).
+    """
+    return (
+        record is not None
+        and record.status.value == "complete"
+        and record.notification is not None
+        and record.notification.notification_delivered
     )

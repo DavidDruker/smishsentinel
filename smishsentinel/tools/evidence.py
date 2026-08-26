@@ -18,13 +18,16 @@ Two things are enforced here that are not just prompted for:
    scoped to that invocation even when another request runs concurrently in
    the same warm container. A bare module global would not: two overlapping
    investigations would silently share one ledger.
-2. **First-party status is computed, not asserted.** The model declares which
-   organization and domain it believes are relevant via
-   ``set_official_domain``; every subsequent fetch is checked against that
-   locked domain, and only pages that actually matched it are ever recorded
-   as first-party. The model cannot later relabel an unrelated domain as
-   official by simply saying so in the evidence card — the ledger already
-   decided, before synthesis ever runs.
+2. **First-party status is computed, not asserted, and the domain itself is
+   looked up, not guessed.** The model names which organization it believes
+   is relevant via ``set_official_domain``, but the domain is resolved from
+   the curated registry in ``registry.py`` — the model never supplies or
+   guesses the domain itself, and an organization outside the registry
+   cannot be locked at all. Every subsequent fetch is checked against
+   whatever domain the registry resolved, and only pages that actually
+   matched it are ever recorded as first-party. The model cannot later
+   relabel an unrelated domain as official by simply saying so in the
+   evidence card — the ledger already decided, before synthesis ever runs.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ from urllib.parse import urlparse
 
 from strands import tool
 
+from .. import registry
 from ..config import MAX_FETCHES_PER_CASE
 from ..safety import UnsafeURLError, safe_fetch, wrap_untrusted
 
@@ -78,6 +82,9 @@ class CaseContext:
     # Locked once, by set_official_domain, before any fetch is permitted.
     official_domain: str | None = None
     claimed_organization: str | None = None
+    # Registry hints for the locked organization's own security/contact
+    # pages, surfaced to the investigator as suggested fetch targets.
+    known_pages: dict[str, str] = field(default_factory=dict)
 
     def remaining(self) -> int:
         return max(0, MAX_FETCHES_PER_CASE - self.fetches_used)
@@ -135,52 +142,74 @@ def current_context() -> CaseContext:
 
 
 @tool
-def set_official_domain(organization: str, domain: str) -> str:
-    """Declare the organization and domain this investigation treats as official.
+def set_official_domain(organization: str) -> str:
+    """Look up and lock the organization this investigation treats as official.
 
     Call this before fetch_official_page or compare_hostname_to_domain — both
-    refuse to run until a domain is locked. Locking happens once: a later call
-    with a different domain is rejected rather than silently switching, so an
+    refuse to run until a domain is locked. There is no domain argument: the
+    domain is resolved from a curated registry (see registry.py and
+    data/organizations.json), never taken from your own knowledge or guessed
+    at, and never copied from the message under investigation. That is a
+    deliberate, hard restriction — a plausible-looking but wrong domain
+    guess is exactly the failure mode this tool exists to prevent.
+
+    If the organization is not in the registry, this returns
+    UNKNOWN_ORGANIZATION and locks nothing. That is a legitimate, honest
+    outcome, not an error to work around: do not fall back to guessing a
+    domain, do not call fetch_official_page, and report that the
+    organization could not be verified against a known source — an
+    insufficient_evidence verdict for an unrecognized organization is
+    correct, not a failure of the investigation.
+
+    Locking happens once per case: a later call naming a different
+    organization is rejected rather than silently switching, so an
     investigation can't drift into treating an unrelated domain as official
-    partway through. Every fetch is checked against this domain; whether a
-    retrieved page counts as first-party evidence is decided by that check,
-    not by anything stated afterward.
+    partway through.
 
     Args:
-        organization: The organization this domain is claimed to belong to,
-            e.g. "Canada Post".
-        domain: The organization's real official domain, from your own
-            knowledge — never copied from the message under investigation.
-            e.g. "canadapost.ca".
+        organization: The organization the message claims to be from, as it
+            appears in the message, e.g. "Canada Post" or "RBC".
 
     Returns:
-        Confirmation of the locked domain, or an explanation if it was already
-        locked to something else.
+        Confirmation of the locked domain and its known first-party pages,
+        UNKNOWN_ORGANIZATION if the registry has no match, or an explanation
+        if a different organization was already locked this case.
     """
     context = current_context()
-    normalized = _normalize_domain(domain)
+    record = registry.resolve(organization)
 
-    if not normalized:
-        return "REJECTED: domain must not be empty."
-
-    if context.official_domain is None:
-        context.official_domain = normalized
-        context.claimed_organization = organization
+    if context.official_domain is not None:
+        if record is not None and context.official_domain == record.domain:
+            return f"ALREADY_LOCKED: official_domain={context.official_domain!r} (unchanged)."
         return (
-            f"LOCKED: official_domain={normalized!r} for organization="
-            f"{organization!r}. fetch_official_page and compare_hostname_to_domain "
-            "will now check against this domain."
+            f"REJECTED: official_domain is already locked to "
+            f"{context.official_domain!r} and cannot be changed mid-investigation. "
+            "If this message genuinely involves a second, unrelated "
+            "organization, note that as a limitation in your summary rather "
+            "than switching domains."
         )
 
-    if context.official_domain == normalized:
-        return f"ALREADY_LOCKED: official_domain={normalized!r} (unchanged)."
+    if record is None:
+        return (
+            f"UNKNOWN_ORGANIZATION: {organization!r} is not in the curated "
+            "registry. No domain is locked, fetch_official_page and "
+            "compare_hostname_to_domain will refuse to run, and this "
+            "organization cannot be verified this way. Report that honestly "
+            "rather than guessing a domain."
+        )
 
+    context.official_domain = record.domain
+    context.claimed_organization = record.canonical_name
+    context.known_pages = dict(record.known_pages)
+    pages = (
+        "; ".join(f"{label}={url}" for label, url in record.known_pages.items())
+        or "(none listed)"
+    )
     return (
-        f"REJECTED: official_domain is already locked to "
-        f"{context.official_domain!r} and cannot be changed to {normalized!r} "
-        "mid-investigation. If this message genuinely involves a second, "
-        "unrelated organization, note that as a limitation in your summary "
-        "rather than switching domains."
+        f"LOCKED: official_domain={record.domain!r} for organization="
+        f"{record.canonical_name!r}. fetch_official_page and "
+        "compare_hostname_to_domain will now check against this domain. "
+        f"Known first-party pages, worth fetching first: {pages}"
     )
 
 

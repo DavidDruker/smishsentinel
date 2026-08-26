@@ -21,10 +21,21 @@ prompt is only worth as much as the case that actually exercises it.
 
 from __future__ import annotations
 
+import time
+
 from .agent import investigate
+from .config import INBOX_CYCLE_DEADLINE_SECONDS
 from .notify import decide, deliver
 from .schemas import TriageResult
-from .store import CaseRecord, CaseStatus, CaseStore, new_case_id
+from .store import (
+    CaseRecord,
+    CaseStatus,
+    CaseStore,
+    DynamoDBCaseStore,
+    NotificationChannel,
+    get_case_store,
+    new_case_id,
+)
 
 SYNTHETIC_INBOX: list[str] = [
     # Ordinary, no claimed organization, no consequential action -- the
@@ -52,7 +63,10 @@ SYNTHETIC_INBOX: list[str] = [
 
 
 def run_inbox_cycle(
-    messages: list[str] | None = None, store: CaseStore | None = None
+    messages: list[str] | None = None,
+    store: CaseStore | DynamoDBCaseStore | None = None,
+    *,
+    deadline_seconds: float = INBOX_CYCLE_DEADLINE_SECONDS,
 ) -> list[CaseRecord]:
     """Run every message in the synthetic inbox through the full lifecycle.
 
@@ -61,9 +75,18 @@ def run_inbox_cycle(
     where it got to rather than silently vanishing. Returns the finalized
     records; ``notify.verify_delivered`` is the independent check that what
     this function claims to have done actually landed in the store.
+
+    Per-stage budgets in config.py bound one message's model calls; they
+    don't bound the whole cycle. ``deadline_seconds`` is that missing ceiling
+    -- checked before each message starts, not mid-investigation, since
+    Strands agents don't expose a way to preempt a call already in flight.
+    Once the deadline has passed, every remaining message is failed without
+    ever calling the model, with a real, persisted, notified record -- not
+    silently dropped and not run anyway.
     """
-    store = store or CaseStore()
+    store = store or get_case_store()
     records: list[CaseRecord] = []
+    start = time.monotonic()
 
     for message in messages if messages is not None else SYNTHETIC_INBOX:
         record = CaseRecord(
@@ -74,6 +97,17 @@ def run_inbox_cycle(
         )
         store.save(record)
 
+        if time.monotonic() - start > deadline_seconds:
+            record.status = CaseStatus.FAILED
+            record.error = (
+                f"Cycle deadline of {deadline_seconds}s exceeded before this "
+                "message could be investigated; skipped without a model call."
+            )
+            record.notification = deliver(record, NotificationChannel.URGENT)
+            store.save(record)
+            records.append(record)
+            continue
+
         record.status = CaseStatus.INVESTIGATING
         store.save(record)
 
@@ -82,6 +116,12 @@ def run_inbox_cycle(
         except Exception as exc:  # noqa: BLE001 - a failed case is a real, visible outcome, not a crash
             record.status = CaseStatus.FAILED
             record.error = f"{type(exc).__name__}: {exc}"
+            # A failure that never notifies anyone is worse than a wrong
+            # verdict -- the user is left thinking the message was checked
+            # when it silently wasn't. Treated as urgent for the same reason
+            # notify.decide treats a missing card as urgent: a defensive
+            # default matters more than an elegant one.
+            record.notification = deliver(record, NotificationChannel.URGENT)
             store.save(record)
             records.append(record)
             continue

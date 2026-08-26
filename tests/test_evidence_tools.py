@@ -33,32 +33,48 @@ from smishsentinel.tools.evidence import (
 )
 
 
+_CANADA_POST_DOMAIN = "canadapost-postescanada.ca"
+
+
 class TestDomainLock(unittest.TestCase):
     def setUp(self) -> None:
         reset_context()
 
-    def test_first_call_locks_the_domain(self) -> None:
-        result = set_official_domain("Canada Post", "canadapost.ca")
+    def test_first_call_locks_the_registry_domain(self) -> None:
+        """There is no domain argument -- the registry decides it."""
+        result = set_official_domain("Canada Post")
         self.assertIn("LOCKED", result)
-        self.assertEqual(current_context().official_domain, "canadapost.ca")
+        self.assertEqual(current_context().official_domain, _CANADA_POST_DOMAIN)
 
-    def test_locking_the_same_domain_again_is_idempotent(self) -> None:
-        set_official_domain("Canada Post", "canadapost.ca")
-        result = set_official_domain("Canada Post", "www.canadapost.ca")  # normalizes the same
+    def test_locking_by_an_alias_resolves_to_the_same_domain(self) -> None:
+        result = set_official_domain("Postes Canada")  # a registered alias
+        self.assertIn("LOCKED", result)
+        self.assertEqual(current_context().official_domain, _CANADA_POST_DOMAIN)
+
+    def test_unknown_organization_locks_nothing(self) -> None:
+        """The abstention path: an org outside the registry can't be locked,
+        so no fetch can ever be counted as first-party for it."""
+        result = set_official_domain("Totally Fictitious Bank of Nowhere")
+        self.assertIn("UNKNOWN_ORGANIZATION", result)
+        self.assertIsNone(current_context().official_domain)
+
+    def test_locking_the_same_organization_again_is_idempotent(self) -> None:
+        set_official_domain("Canada Post")
+        result = set_official_domain("Canada Post")
         self.assertIn("ALREADY_LOCKED", result)
-        self.assertEqual(current_context().official_domain, "canadapost.ca")
+        self.assertEqual(current_context().official_domain, _CANADA_POST_DOMAIN)
 
-    def test_locking_a_different_domain_is_rejected(self) -> None:
+    def test_locking_a_different_organization_is_rejected(self) -> None:
         """A model cannot relabel an unrelated domain as official mid-case."""
-        set_official_domain("Canada Post", "canadapost.ca")
-        result = set_official_domain("Canada Post", "some-other-site.com")
+        set_official_domain("Canada Post")
+        result = set_official_domain("RBC")
 
         self.assertIn("REJECTED", result)
-        self.assertEqual(current_context().official_domain, "canadapost.ca")
+        self.assertEqual(current_context().official_domain, _CANADA_POST_DOMAIN)
 
     def test_fetch_is_blocked_before_any_domain_is_locked(self) -> None:
         with mock.patch("smishsentinel.tools.evidence.safe_fetch") as mock_fetch:
-            result = fetch_official_page("https://canadapost.ca/fraud")
+            result = fetch_official_page(f"https://{_CANADA_POST_DOMAIN}/fraud")
 
         self.assertIn("BLOCKED", result)
         mock_fetch.assert_not_called()
@@ -67,7 +83,7 @@ class TestDomainLock(unittest.TestCase):
         """The core of the fix: the model cannot fetch an arbitrary domain and
         have it counted as first-party just by asserting so afterward — it
         cannot even fetch it as evidence in the first place."""
-        set_official_domain("Canada Post", "canadapost.ca")
+        set_official_domain("Canada Post")
 
         with mock.patch("smishsentinel.tools.evidence.safe_fetch") as mock_fetch:
             result = fetch_official_page("https://totally-unrelated-site.com/page")
@@ -77,16 +93,16 @@ class TestDomainLock(unittest.TestCase):
         mock_fetch.assert_not_called()
 
     def test_fetch_on_a_subdomain_of_the_locked_domain_is_allowed(self) -> None:
-        set_official_domain("Canada Post", "canadapost.ca")
+        set_official_domain("Canada Post")
 
         with mock.patch("smishsentinel.tools.evidence.safe_fetch") as mock_fetch:
             from smishsentinel.safety import FetchResult
+            url = f"https://track.{_CANADA_POST_DOMAIN}/fraud"
             mock_fetch.return_value = FetchResult(
-                url="https://track.canadapost.ca/fraud",
-                final_url="https://track.canadapost.ca/fraud",
+                url=url, final_url=url,
                 status=200, text="Some real page text.", truncated=False,
             )
-            fetch_official_page("https://track.canadapost.ca/fraud")
+            fetch_official_page(url)
 
         mock_fetch.assert_called_once()
 
@@ -95,23 +111,23 @@ class TestDomainLock(unittest.TestCase):
         self.assertIn("BLOCKED", result)
 
     def test_hostname_comparison_uses_the_locked_domain(self) -> None:
-        set_official_domain("Canada Post", "canadapost.ca")
+        set_official_domain("Canada Post")
         result = compare_hostname_to_domain("canadapost-fake.xyz")
         self.assertIn("NO_MATCH", result)
 
     def test_recorded_fetch_first_party_flag_reflects_domain_match(self) -> None:
         """Integration-shaped: a real fetch on the locked domain is recorded
         as first-party without the tool itself ever asking the model."""
-        set_official_domain("Canada Post", "canadapost.ca")
+        set_official_domain("Canada Post")
 
         with mock.patch("smishsentinel.tools.evidence.safe_fetch") as mock_fetch:
             from smishsentinel.safety import FetchResult
+            url = f"https://{_CANADA_POST_DOMAIN}/fraud"
             mock_fetch.return_value = FetchResult(
-                url="https://canadapost.ca/fraud",
-                final_url="https://canadapost.ca/fraud",
+                url=url, final_url=url,
                 status=200, text="Real page text.", truncated=False,
             )
-            fetch_official_page("https://canadapost.ca/fraud")
+            fetch_official_page(url)
 
         entry = current_context().fetch_log[0]
         self.assertTrue(entry["is_first_party"])

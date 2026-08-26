@@ -1,8 +1,8 @@
 """The SmishSentinel investigation pipeline.
 
-Three specialist agents, composed rather than merged:
+Four specialist agents, composed rather than merged:
 
-    triage  ->  investigator (tools)  ->  synthesist
+    triage  ->  claim extraction  ->  investigator (tools)  ->  synthesist
 
 The split is not decoration. Triage runs on every message and must be cheap and
 tool-free, so it gets the small model and a two-turn ceiling. The investigator
@@ -34,7 +34,7 @@ from .config import (
     TRIAGE_MODEL,
 )
 from .safety import wrap_untrusted
-from .schemas import ClaimSet, EvidenceCard, TriageResult, Verdict
+from .schemas import ClaimSet, ClaimStatus, EvidenceCard, RiskLevel, TriageResult, Verdict
 from .tools.evidence import (
     compare_hostname_to_domain,
     current_context,
@@ -113,19 +113,21 @@ You are the investigation stage. Your job is to find out what the claimed \
 organization itself publishes about the message's claims.
 
 Method:
-  1. Work out the organization's real official domain from your own knowledge \
-of the organization — never from the message. If you are unsure of the domain, \
-say so rather than guessing at a plausible-looking one.
-  2. Call set_official_domain with that organization and domain before doing \
-anything else. This locks it for the rest of the investigation: \
-fetch_official_page and compare_hostname_to_domain both refuse to run until \
-you have, and neither can be pointed at a different domain afterward. If the \
-message plausibly involves more than one organization, lock the one the \
-requested action is actually about and note the other as a limitation later — \
-do not try to switch domains partway through.
-  3. Use fetch_official_page on that locked domain's own pages — its security, \
-fraud, scam-alert, contact, or policy pages are the highest-value targets. A \
-URL on a different domain will be refused before any request is made.
+  1. Call set_official_domain with just the organization's name — you do not \
+supply or guess a domain; it is resolved from a curated registry. If the \
+message plausibly involves more than one organization, name the one the \
+requested action is actually about and note the other as a limitation later \
+— do not try to lock a second one partway through.
+  2. If the result is UNKNOWN_ORGANIZATION, the registry has no verified \
+domain for this name. Do not guess one, do not call fetch_official_page, and \
+say plainly that this organization could not be verified against a known \
+source. That is a correct, honest outcome — insufficient_evidence for an \
+unrecognized organization is not a failure of the investigation.
+  3. If it locks, the response lists that organization's known first-party \
+pages — fetch those first with fetch_official_page. Its security, fraud, \
+scam-alert, contact, or policy pages are the highest-value targets in \
+general. A URL on a different domain will be refused before any request is \
+made.
   4. If the message contained a visible hostname, use \
 compare_hostname_to_domain to check it against the locked domain.
   5. Before you finish, call report_fetch_ledger and confirm which evidence IDs \
@@ -286,17 +288,97 @@ def build_synthesis_agent() -> Agent:
 
 _CITATION_ID = re.compile(r"\(E\d+\)")
 
+# Statuses that assert an affirmative relationship between the claim and
+# retrieved evidence. NOT_ADDRESSED ("no evidence spoke to this") and
+# SOURCE_UNUSABLE ("we couldn't use what we tried") make no such assertion,
+# so they aren't held to the same all-cited-ids-must-verify standard.
+_EVIDENCE_BACKED_STATUSES = {
+    ClaimStatus.CONTRADICTED,
+    ClaimStatus.SUPPORTED,
+    ClaimStatus.PARTIALLY_SUPPORTED,
+    ClaimStatus.UNSUPPORTED,
+}
+
+# Severity order, weakest to strongest -- used only to clamp risk_level
+# downward after a downgrade, never to raise it.
+_RISK_ORDER = [RiskLevel.QUIET, RiskLevel.UNCLEAR, RiskLevel.ELEVATED, RiskLevel.HIGH]
+
+# The strongest risk_level a downgraded verdict can honestly support.
+_RISK_CEILING_BY_VERDICT = {
+    Verdict.KNOWN_MALICIOUS: RiskLevel.HIGH,
+    Verdict.OFFICIAL_CONTRADICTION: RiskLevel.HIGH,
+    Verdict.SUSPICIOUS_UNCONFIRMED: RiskLevel.ELEVATED,
+    Verdict.INSUFFICIENT_EVIDENCE: RiskLevel.ELEVATED,
+    Verdict.NO_CONTRADICTION_FOUND: RiskLevel.UNCLEAR,
+}
+
+# Headline text a downgraded verdict can actually stand behind. A downgrade
+# to one of these two verdicts means the original headline may still be
+# asserting a conclusion (e.g. "this is a contradiction") that no longer has
+# verified support, so it is replaced rather than left to go stale.
+_DOWNGRADE_HEADLINES = {
+    Verdict.INSUFFICIENT_EVIDENCE: (
+        "An earlier conclusion about this message could not be verified "
+        "against the retrieved evidence and was withdrawn. Treat it with "
+        "caution and verify independently before acting."
+    ),
+    Verdict.NO_CONTRADICTION_FOUND: (
+        "An earlier conclusion about this message could not be verified "
+        "against the retrieved evidence, and no contradiction was "
+        "independently confirmed either — this is not reassurance that the "
+        "message is genuine."
+    ),
+}
+
 
 def _cited_ids(text: str) -> set[str]:
     return {m.strip("()") for m in _CITATION_ID.findall(text)}
 
 
+def _reconcile_after_downgrade(card: EvidenceCard, reasons: list[str]) -> None:
+    """Bring risk_level, headline, inferences, and safe_next_action back into
+    agreement with a verdict that was just downgraded.
+
+    A downgraded verdict with a headline that still asserts the withdrawn
+    conclusion, or inferences reasoned from it, is a worse failure than the
+    downgrade itself — it reads as resolved to the one person actually
+    looking at the card. Every change here moves toward less certainty, never
+    more: a citation failing verification can only ever make a message look
+    less confirmed, never safer.
+    """
+    ceiling = _RISK_CEILING_BY_VERDICT[card.verdict]
+    if _RISK_ORDER.index(card.risk_level) > _RISK_ORDER.index(ceiling):
+        card.risk_level = ceiling
+
+    template = _DOWNGRADE_HEADLINES.get(card.verdict)
+    if template:
+        card.headline = template
+
+    if card.inferences:
+        card.inferences = []
+        reasons.append(
+            "Prior inferences were withdrawn because they were reasoned "
+            "from a verdict that could not be verified against the fetch "
+            "ledger."
+        )
+
+    if not card.safe_next_action.strip():
+        card.safe_next_action = (
+            "Contact the organization using a number, official app, or "
+            "website you find independently — never one from this message."
+        )
+
+    for reason in reasons:
+        if reason not in card.unresolved:
+            card.unresolved.append(reason)
+
+
 def _enforce_citations(card: EvidenceCard) -> EvidenceCard:
     """Verify every citation against the ledger. Nothing here trusts the model.
 
-    A citation only survives if ALL of the following hold, checked against the
-    fetch ledger built during investigation, not against anything the model
-    wrote in the card:
+    An EvidenceItem only survives if ALL of the following hold, checked
+    against the fetch ledger built during investigation, not against
+    anything the model wrote in the card:
 
       - the evidence_id was actually fetched (not a phantom ID);
       - the cited source_url matches what was actually fetched at that ID
@@ -311,11 +393,30 @@ def _enforce_citations(card: EvidenceCard) -> EvidenceCard:
         written, since those are exactly the fields a model could otherwise
         assert without any check.
 
-    Anything that fails is removed, not corrected — a partially-fabricated
-    citation is still fabricated. Claim assessments and free-text
-    verified_facts that cite a dropped ID are stripped in turn, and a verdict
-    that depends on evidence-backed citations is downgraded if nothing
-    survives.
+    Everything downstream of that per-item check is held to the same
+    all-or-nothing standard, not just "at least one real ID survived":
+
+      - a claim_assessment asserting CONTRADICTED/SUPPORTED/PARTIALLY_SUPPORTED/
+        UNSUPPORTED needs every one of its cited IDs to verify, not merely
+        one — losing any of them invalidates the whole assessment, since the
+        rationale was written against the full set, not a subset of it. It is
+        downgraded to SOURCE_UNUSABLE if it had cited evidence that failed,
+        or NOT_ADDRESSED if it asserted such a status with no citation at all;
+      - a verified_fact with no "(E<n>)" marker, or one where any cited ID
+        fails verification, is dropped outright — "verified" with an
+        unverifiable citation is not verified;
+      - OFFICIAL_CONTRADICTION requires not just that some evidence survived,
+        but that a claim_assessment is actually CONTRADICTED by verified
+        evidence — surviving evidence that isn't linked to a contradicted
+        claim doesn't justify the verdict;
+      - whenever any of the above forces the top-level verdict itself to
+        change, risk_level, headline, inferences, and safe_next_action are
+        reconciled to that new verdict (see _reconcile_after_downgrade) so
+        the card never asserts a conclusion its own evidence no longer
+        supports.
+
+    Anything that fails is removed or downgraded, not corrected — a
+    partially-fabricated citation is still fabricated.
     """
     context = current_context()
     ledger_by_id = {entry["evidence_id"]: entry for entry in context.fetch_log}
@@ -352,48 +453,110 @@ def _enforce_citations(card: EvidenceCard) -> EvidenceCard:
 
     card.evidence = kept_evidence
 
+    # --- claim assessments: an evidence-backed status needs ALL of its cited
+    # ids to survive verification, not merely one surviving out of several.
+    any_assessment_downgraded = False
     for assessment in card.claim_assessments:
-        surviving = [i for i in assessment.supporting_evidence_ids if i in verified_ids]
-        if surviving != assessment.supporting_evidence_ids:
-            assessment.supporting_evidence_ids = surviving
-            if not surviving:
-                assessment.rationale += (
-                    " [Citation removed: could not be verified against the "
-                    "fetch ledger, the retrieved text, or the locked official "
-                    "domain.]"
-                )
+        original_ids = list(assessment.supporting_evidence_ids)
+        valid_ids = [i for i in original_ids if i in verified_ids]
 
-    # verified_facts is free text with inline "(E<n>)" markers, not a
+        if assessment.status not in _EVIDENCE_BACKED_STATUSES:
+            # NOT_ADDRESSED / SOURCE_UNUSABLE assert nothing evidence-backed;
+            # still strip any phantom ids for hygiene, but no status change.
+            assessment.supporting_evidence_ids = valid_ids
+            continue
+
+        if original_ids and len(valid_ids) == len(original_ids):
+            assessment.supporting_evidence_ids = valid_ids  # all cited ids verified
+            continue
+
+        # Either every cited id failed to verify, some subset did, or the
+        # model asserted an evidence-backed status while citing nothing —
+        # all three are the same failure: the status cannot stand on what
+        # actually survived.
+        old_status = assessment.status
+        assessment.supporting_evidence_ids = []
+        assessment.status = (
+            ClaimStatus.SOURCE_UNUSABLE if original_ids else ClaimStatus.NOT_ADDRESSED
+        )
+        assessment.rationale += (
+            f" [Status downgraded from {old_status.value} to "
+            f"{assessment.status.value}: "
+            + (
+                "one or more cited evidence IDs failed verification against "
+                "the fetch ledger."
+                if original_ids
+                else "this status requires cited evidence and none was given."
+            )
+            + "]"
+        )
+        any_assessment_downgraded = True
+
+    # --- verified_facts: free text with inline "(E<n>)" markers, not a
     # structured field — parse those markers out and hold each fact to the
-    # same standard as a structured citation. A fact citing zero surviving
-    # IDs was never actually verified, whatever the model called it.
+    # same standard as a structured citation. A fact with no citation at all
+    # was never actually verified, and neither was one where any cited ID
+    # fails — surviving on the strength of whichever other IDs happened to
+    # verify is exactly the "merely one valid ID" gap this closes.
     surviving_facts = []
     any_fact_dropped = False
     for fact in card.verified_facts:
         cited = _cited_ids(fact)
-        if cited and not cited & verified_ids:
+        if not cited or not cited <= verified_ids:
             any_fact_dropped = True
             continue
         surviving_facts.append(fact)
     card.verified_facts = surviving_facts
 
-    evidence_backed = {Verdict.OFFICIAL_CONTRADICTION, Verdict.KNOWN_MALICIOUS}
-    if card.verdict in evidence_backed and not kept_evidence:
+    # --- the top-level verdict
+    original_verdict = card.verdict
+    reasons: list[str] = []
+
+    if card.verdict in (Verdict.OFFICIAL_CONTRADICTION, Verdict.KNOWN_MALICIOUS) and not kept_evidence:
         card.verdict = Verdict.INSUFFICIENT_EVIDENCE
-        card.unresolved.append(
+        reasons.append(
             "A verdict was proposed on evidence that could not be verified "
             "against the fetch ledger, so it was withdrawn."
         )
+
+    has_verified_contradiction = any(
+        a.status == ClaimStatus.CONTRADICTED and a.supporting_evidence_ids
+        for a in card.claim_assessments
+    )
+    if card.verdict == Verdict.OFFICIAL_CONTRADICTION and not has_verified_contradiction:
+        card.verdict = Verdict.INSUFFICIENT_EVIDENCE
+        reasons.append(
+            "The verdict asserted an official contradiction, but no claim "
+            "assessment with a verified contradiction survived citation "
+            "enforcement, so it was withdrawn."
+        )
+
+    if card.verdict != original_verdict:
+        _reconcile_after_downgrade(card, reasons)
+
     if any_fact_dropped:
         card.unresolved.append(
             "One or more claimed facts cited evidence that failed "
             "verification and were removed."
         )
+    if any_assessment_downgraded:
+        card.unresolved.append(
+            "One or more claim assessments cited evidence that failed "
+            "verification and were downgraded."
+        )
 
     return card
 
 
-def investigate(message_text: str, *, verbose: bool = False) -> dict:
+def investigate(
+    message_text: str,
+    *,
+    verbose: bool = False,
+    triage_agent: object | None = None,
+    claim_agent: object | None = None,
+    investigator_agent: object | None = None,
+    synthesis_agent: object | None = None,
+) -> dict:
     """Run one message through the full pipeline.
 
     Returns a dict with ``investigated`` (bool) and either ``triage`` alone,
@@ -402,11 +565,22 @@ def investigate(message_text: str, *, verbose: bool = False) -> dict:
     The message is wrapped as untrusted content at every stage that sees it, so
     an instruction embedded in the message reads as data rather than as part of
     the prompt.
+
+    The four ``*_agent`` parameters default to the real Bedrock-backed agents
+    built above; passing an alternative is the seam
+    ``tests/test_deterministic_eval.py`` uses to run this exact function --
+    the real orchestration, the real tool calls, the real
+    ``_enforce_citations`` -- against fake, deterministic agents instead of
+    live Bedrock, so the pipeline has offline coverage beyond its stages
+    tested in isolation. Each substitute only needs to satisfy the call shape
+    used below (callable with a prompt and, where applicable,
+    ``structured_output_model``/``limits`` keywords), not be a real
+    ``strands.Agent``.
     """
     context = reset_context()
     wrapped = wrap_untrusted(message_text, source="user_submitted_message")
 
-    triage_agent = build_triage_agent()
+    triage_agent = triage_agent or build_triage_agent()
     triage_result = triage_agent(
         f"Assess this message for triage.\n\n{wrapped}",
         structured_output_model=TriageResult,
@@ -421,7 +595,7 @@ def investigate(message_text: str, *, verbose: bool = False) -> dict:
     if not triage.warrants_investigation:
         return {"investigated": False, "triage": triage, "card": None}
 
-    claim_agent = build_claim_agent()
+    claim_agent = claim_agent or build_claim_agent()
     claim_result = claim_agent(
         f"Extract checkable claims from this message.\n\n{wrapped}",
         structured_output_model=ClaimSet,
@@ -435,7 +609,7 @@ def investigate(message_text: str, *, verbose: bool = False) -> dict:
     claim_lines = "\n".join(
         f"  {c.claim_id}: {c.claim_text}" for c in claims.claims
     )
-    investigator = build_investigator_agent()
+    investigator = investigator_agent or build_investigator_agent()
     investigation = investigator(
         f"""Investigate these claims about a message allegedly from \
 "{triage.claimed_organization or 'an unnamed organization'}".
@@ -453,7 +627,7 @@ Retrieve what the organization itself publishes that bears on these claims.""",
     if verbose:
         print(f"[investigation] {context.fetches_used} pages fetched")
 
-    synthesist = build_synthesis_agent()
+    synthesist = synthesis_agent or build_synthesis_agent()
     card_result = synthesist(
         f"""Produce the evidence card.
 

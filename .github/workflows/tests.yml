@@ -1,0 +1,32 @@
+name: tests
+
+# Runs the offline test suite only -- nothing here needs AWS credentials or
+# network access. smoke_test.py (live Bedrock) and the agentcore deploy
+# steps are deliberately not run in CI; see README.md's "Running it" for how
+# to run those locally against a real account.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install pinned dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run offline test suite
+        run: python -m unittest discover -s tests -v

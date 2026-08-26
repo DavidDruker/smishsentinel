@@ -15,7 +15,7 @@ import unittest
 from unittest import mock
 
 from smishsentinel.inbox import run_inbox_cycle
-from smishsentinel.notify import decide, deliver, verify_delivered
+from smishsentinel.notify import decide, deliver, verify_delivered, verify_notification_sent
 from smishsentinel.schemas import RequestedAction, RiskLevel, TriageResult, Verdict
 from smishsentinel.store import CaseRecord, CaseStatus, CaseStore, NotificationChannel, new_case_id
 
@@ -90,7 +90,8 @@ class TestCaseStore(unittest.TestCase):
         loaded = self.store.get(record.case_id)
         self.assertEqual(loaded.status, CaseStatus.COMPLETE)
         self.assertEqual(loaded.notification.channel, NotificationChannel.URGENT)
-        self.assertTrue(loaded.notification.delivered)
+        self.assertTrue(loaded.notification.decision_recorded)
+        self.assertTrue(loaded.notification.notification_delivered)
 
 
 class TestNotifyPolicy(unittest.TestCase):
@@ -120,20 +121,23 @@ class TestDeliveryAndVerification(unittest.TestCase):
             status=status, message_text="x",
         )
 
-    def test_suppression_is_itself_recorded_as_delivered(self) -> None:
+    def test_suppression_is_recorded_as_a_decision_but_not_a_delivery(self) -> None:
         """A suppressed case still has a real, checkable outcome -- the
         record proves the decision was made and executed, not silently
-        dropped."""
+        dropped -- but it must not claim a notification went out when
+        nothing was actually sent."""
         record = self._record(CaseStatus.COMPLETE)
         notification = deliver(record, NotificationChannel.NONE)
-        self.assertTrue(notification.delivered)
+        self.assertTrue(notification.decision_recorded)
+        self.assertFalse(notification.notification_delivered)
         self.assertEqual(notification.detail, "suppressed")
 
     def test_notify_delivery_includes_the_headline(self) -> None:
         record = self._record(CaseStatus.COMPLETE)
         record.card = {"headline": "Do not click this link."}
         notification = deliver(record, NotificationChannel.URGENT)
-        self.assertTrue(notification.delivered)
+        self.assertTrue(notification.decision_recorded)
+        self.assertTrue(notification.notification_delivered)
         self.assertIn("Do not click this link.", notification.detail)
         self.assertIsNotNone(notification.delivered_at)
 
@@ -154,6 +158,20 @@ class TestDeliveryAndVerification(unittest.TestCase):
         record.notification = deliver(record, NotificationChannel.STANDARD)
         self.assertTrue(verify_delivered(record))
 
+    def test_verify_notification_sent_is_false_for_a_suppressed_case(self) -> None:
+        """The distinction verify_delivered can't make on its own: a
+        suppressed case completed correctly (verify_delivered=True) but no
+        notification actually reached anyone (verify_notification_sent=False)."""
+        record = self._record(CaseStatus.COMPLETE)
+        record.notification = deliver(record, NotificationChannel.NONE)
+        self.assertTrue(verify_delivered(record))
+        self.assertFalse(verify_notification_sent(record))
+
+    def test_verify_notification_sent_is_true_for_a_real_delivery(self) -> None:
+        record = self._record(CaseStatus.COMPLETE)
+        record.notification = deliver(record, NotificationChannel.URGENT)
+        self.assertTrue(verify_notification_sent(record))
+
 
 class TestInboxCycle(unittest.TestCase):
     def setUp(self) -> None:
@@ -173,6 +191,26 @@ class TestInboxCycle(unittest.TestCase):
         self.assertEqual(record.status, CaseStatus.COMPLETE)
         self.assertEqual(record.notification.channel, NotificationChannel.NONE)
         self.assertTrue(verify_delivered(self.store.get(record.case_id)))
+
+    def test_cycle_deadline_fails_remaining_messages_without_a_model_call(self) -> None:
+        """The overall-cycle latency ceiling: an exceeded deadline fails every
+        remaining message outright rather than continuing to burn model
+        calls and wall-clock time. deadline_seconds=-1 guarantees the check
+        trips before the very first message, so investigate() must never be
+        called at all."""
+        with mock.patch("smishsentinel.inbox.investigate") as mock_investigate:
+            records = run_inbox_cycle(
+                messages=["a", "b", "c"], store=self.store, deadline_seconds=-1,
+            )
+
+        mock_investigate.assert_not_called()
+        self.assertEqual(len(records), 3)
+        for record in records:
+            self.assertEqual(record.status, CaseStatus.FAILED)
+            self.assertIn("deadline", record.error.lower())
+            self.assertIsNotNone(record.notification)
+            self.assertEqual(record.notification.channel, NotificationChannel.URGENT)
+            self.assertTrue(record.notification.notification_delivered)
 
     def test_investigated_message_ends_notified_and_persisted(self) -> None:
         card = mock.Mock(risk_level=RiskLevel.HIGH)
@@ -200,7 +238,28 @@ class TestInboxCycle(unittest.TestCase):
         self.assertIn("simulated Bedrock outage", record.error)
         loaded = self.store.get(record.case_id)
         self.assertEqual(loaded.status, CaseStatus.FAILED)
+        # status stays FAILED, not COMPLETE, so verify_delivered is correctly
+        # false regardless of the notification below -- it answers "did the
+        # pipeline finish," and it didn't.
         self.assertFalse(verify_delivered(loaded))
+
+    def test_pipeline_exception_still_notifies_the_user(self) -> None:
+        """The gap a reviewer found: a failed investigation used to leave a
+        FAILED record with no notification at all -- the user was never told
+        their message couldn't be checked. A failure to investigate must
+        reach the user, not vanish silently."""
+        with mock.patch("smishsentinel.inbox.investigate") as mock_investigate:
+            mock_investigate.side_effect = RuntimeError("simulated Bedrock outage")
+            records = run_inbox_cycle(messages=["will blow up"], store=self.store)
+
+        record = records[0]
+        self.assertIsNotNone(record.notification)
+        self.assertEqual(record.notification.channel, NotificationChannel.URGENT)
+        self.assertTrue(record.notification.notification_delivered)
+
+        loaded = self.store.get(record.case_id)
+        self.assertIsNotNone(loaded.notification)
+        self.assertTrue(loaded.notification.notification_delivered)
 
     def test_multi_message_cycle_persists_every_case_independently(self) -> None:
         with mock.patch("smishsentinel.inbox.investigate") as mock_investigate:

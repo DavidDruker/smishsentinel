@@ -46,6 +46,17 @@ def _card(**overrides) -> EvidenceCard:
 _REAL_QUOTE = "We will never request payment by text message."
 
 
+def _contradicted_assessment(
+    supporting_evidence_ids: list[str], claim_id: str = "C1"
+) -> ClaimAssessment:
+    return ClaimAssessment(
+        claim_id=claim_id,
+        status=ClaimStatus.CONTRADICTED,
+        supporting_evidence_ids=supporting_evidence_ids,
+        rationale="Canada Post's own fraud page contradicts the fee claim.",
+    )
+
+
 def _evidence(
     evidence_id: str,
     url: str,
@@ -85,7 +96,10 @@ class TestCitationEnforcement(unittest.TestCase):
             text=_REAL_QUOTE, is_first_party=True,
         )
 
-        card = _card(evidence=[_evidence("E1", "https://canadapost.ca/fraud")])
+        card = _card(
+            evidence=[_evidence("E1", "https://canadapost.ca/fraud")],
+            claim_assessments=[_contradicted_assessment(["E1"])],
+        )
         result = _enforce_citations(card)
 
         self.assertEqual(len(result.evidence), 1)
@@ -200,26 +214,102 @@ class TestCitationEnforcement(unittest.TestCase):
         self.assertEqual(result.verdict, Verdict.INSUFFICIENT_EVIDENCE)
         self.assertTrue(result.unresolved, "downgrade must explain itself")
 
-    def test_claim_assessment_loses_phantom_support(self) -> None:
+    def test_claim_assessment_with_one_phantom_id_loses_all_support(self) -> None:
+        """All cited IDs must verify, not merely one out of several.
+
+        E1 is genuine; E7 was never fetched. The assessment's rationale was
+        written against both together, so surviving on E1 alone would let a
+        partly-fabricated citation stand -- the whole assessment is
+        downgraded instead of quietly dropping just the bad id.
+        """
         self.context.record(
             "https://canadapost.ca/fraud", "https://canadapost.ca/fraud", 200,
             text=_REAL_QUOTE, is_first_party=True,
         )
 
         card = _card(
+            verdict=Verdict.OFFICIAL_CONTRADICTION,
             evidence=[_evidence("E1", "https://canadapost.ca/fraud")],
-            claim_assessments=[
-                ClaimAssessment(
-                    claim_id="C1",
-                    status=ClaimStatus.CONTRADICTED,
-                    supporting_evidence_ids=["E1", "E7"],  # E7 never fetched
-                    rationale="Official page contradicts the fee claim.",
-                )
-            ],
+            claim_assessments=[_contradicted_assessment(["E1", "E7"])],
         )
         result = _enforce_citations(card)
 
-        self.assertEqual(result.claim_assessments[0].supporting_evidence_ids, ["E1"])
+        assessment = result.claim_assessments[0]
+        self.assertEqual(assessment.supporting_evidence_ids, [])
+        self.assertEqual(assessment.status, ClaimStatus.SOURCE_UNUSABLE)
+        # The evidence-backed verdict can no longer point to any verified
+        # contradiction, so it must fall too.
+        self.assertEqual(result.verdict, Verdict.INSUFFICIENT_EVIDENCE)
+
+    def test_claim_assessment_with_no_citation_becomes_not_addressed(self) -> None:
+        """An evidence-backed status asserted with zero supporting IDs was
+        never actually verified -- distinct from citing IDs that fail."""
+        card = _card(
+            claim_assessments=[_contradicted_assessment([])],
+        )
+        result = _enforce_citations(card)
+
+        assessment = result.claim_assessments[0]
+        self.assertEqual(assessment.status, ClaimStatus.NOT_ADDRESSED)
+
+    def test_official_contradiction_requires_a_linked_contradicted_claim(self) -> None:
+        """Surviving evidence alone doesn't justify OFFICIAL_CONTRADICTION --
+        it must actually be the support for a CONTRADICTED claim assessment."""
+        self.context.record(
+            "https://canadapost.ca/fraud", "https://canadapost.ca/fraud", 200,
+            text=_REAL_QUOTE, is_first_party=True,
+        )
+
+        card = _card(
+            verdict=Verdict.OFFICIAL_CONTRADICTION,
+            evidence=[_evidence("E1", "https://canadapost.ca/fraud")],
+            claim_assessments=[],  # nothing actually marked contradicted
+        )
+        result = _enforce_citations(card)
+
+        self.assertEqual(len(result.evidence), 1, "the evidence itself is genuine")
+        self.assertEqual(result.verdict, Verdict.INSUFFICIENT_EVIDENCE)
+
+    def test_downgrade_reconciles_headline_risk_and_inferences(self) -> None:
+        """The exact reviewer-reported gap: a verdict can be pulled down to
+        insufficient_evidence while the headline still states a contradiction.
+        Every field that asserted the withdrawn conclusion must move too."""
+        card = _card(
+            verdict=Verdict.OFFICIAL_CONTRADICTION,
+            risk_level=RiskLevel.HIGH,
+            headline="This is confirmed fraud; Canada Post says so directly.",
+            inferences=["This message is part of a known redelivery-fee scam."],
+            safe_next_action="",
+            evidence=[_evidence("E1", "https://canadapost.ca/invented")],  # phantom
+            claim_assessments=[_contradicted_assessment(["E1"])],
+        )
+        result = _enforce_citations(card)
+
+        self.assertEqual(result.verdict, Verdict.INSUFFICIENT_EVIDENCE)
+        self.assertNotIn("confirmed fraud", result.headline)
+        self.assertIn("could not be verified", result.headline)
+        self.assertIn(
+            result.risk_level, (RiskLevel.QUIET, RiskLevel.UNCLEAR, RiskLevel.ELEVATED)
+        )
+        self.assertEqual(result.inferences, [])
+        self.assertTrue(result.safe_next_action.strip())
+        self.assertTrue(
+            any("inferences were withdrawn" in u.lower() for u in result.unresolved)
+        )
+
+    def test_downgrade_never_raises_risk_level(self) -> None:
+        """Reconciliation only ever moves risk_level down, never up -- a
+        genuinely low starting risk_level must not be inflated to the ceiling."""
+        card = _card(
+            verdict=Verdict.OFFICIAL_CONTRADICTION,
+            risk_level=RiskLevel.UNCLEAR,
+            evidence=[_evidence("E1", "https://canadapost.ca/invented")],  # phantom
+            claim_assessments=[_contradicted_assessment(["E1"])],
+        )
+        result = _enforce_citations(card)
+
+        self.assertEqual(result.verdict, Verdict.INSUFFICIENT_EVIDENCE)
+        self.assertEqual(result.risk_level, RiskLevel.UNCLEAR)
 
     def test_verified_fact_citing_a_failed_fetch_is_dropped(self) -> None:
         """verified_facts is free text with inline (E<n>) markers, not a
@@ -238,13 +328,15 @@ class TestCitationEnforcement(unittest.TestCase):
             result.unresolved,
         )
 
-    def test_verified_fact_with_no_citation_is_left_alone(self) -> None:
-        """A fact with no (E<n>) marker at all isn't a citation claim and
-        shouldn't be touched by citation enforcement."""
+    def test_verified_fact_with_no_citation_is_dropped(self) -> None:
+        """A "verified fact" with no (E<n>) marker was never actually
+        verified against anything -- the schema requires every one to cite
+        an evidence id, so the absence of one is itself a failure to drop,
+        not a pass-through case."""
         card = _card(verified_facts=["The message uses a .xyz domain."])
         result = _enforce_citations(card)
 
-        self.assertEqual(result.verified_facts, ["The message uses a .xyz domain."])
+        self.assertEqual(result.verified_facts, [])
 
     def test_suspicious_verdict_survives_without_evidence(self) -> None:
         """Behavioural suspicion needs no citation, so it must not downgrade."""

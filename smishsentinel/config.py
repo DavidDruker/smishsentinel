@@ -58,3 +58,11 @@ SYNTHESIS_BUDGET = StageBudget(turns=3, output_tokens=3000)
 
 # Hard ceiling on evidence fetches per case, independent of model behaviour.
 MAX_FETCHES_PER_CASE = 6
+
+# Per-stage turn/token budgets (above) bound a single message. They do not
+# bound a whole run_inbox_cycle() -- five messages each hitting their full
+# budget is still five times the model calls and wall-clock time of one, with
+# no ceiling on the total. This is that ceiling: once elapsed time in a cycle
+# passes it, every remaining message is failed without a model call rather
+# than silently continuing to spend time and money.
+INBOX_CYCLE_DEADLINE_SECONDS = int(os.environ.get("SMISH_INBOX_CYCLE_DEADLINE_SECONDS", "180"))
