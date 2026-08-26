@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from bedrock_agentcore import BedrockAgentCoreApp
 from pydantic import BaseModel, ValidationError, field_validator
+from starlette.exceptions import HTTPException
 
 from smishsentinel.agent import investigate
 
@@ -50,6 +51,24 @@ def _serialize(result: dict) -> dict:
     }
 
 
+def _clean_validation_detail(exc: ValidationError) -> list[dict[str, object]]:
+    """Reduce pydantic's error list to JSON-native fields only.
+
+    ``ValidationError.errors()`` can include a ``ctx`` entry holding the
+    original Python exception object (e.g. a ``ValueError``), and an
+    ``input`` entry echoing back whatever the caller sent — neither is
+    guaranteed JSON-serializable, and letting either through was exactly what
+    made an invalid request come back as a 200 with a Python-repr string
+    smuggled into the JSON body instead of a clean 4xx: the framework's
+    serializer degrades to `str(obj)` on the whole payload the moment any one
+    field fails to encode, rather than failing just that field.
+    """
+    return [
+        {"field": ".".join(str(p) for p in e["loc"]), "message": e["msg"], "type": e["type"]}
+        for e in exc.errors()
+    ]
+
+
 @app.entrypoint
 def invoke(payload: dict) -> dict:
     """AgentCore calls this with whatever JSON body the caller POSTed.
@@ -57,11 +76,20 @@ def invoke(payload: dict) -> dict:
     ``payload`` is caller-controlled and therefore untrusted: it is validated
     into ``InvocationRequest`` before anything else happens, and only the
     resulting plain string is ever handed to an agent.
+
+    Raising ``HTTPException`` (rather than returning an error dict) is what
+    actually produces a real 4xx: this app's underlying framework only sets a
+    non-200 status when the handler raises HTTPException or returns a
+    Response object directly — a plain returned dict always serializes as a
+    200, whatever it contains.
     """
     try:
         request = InvocationRequest.model_validate(payload)
     except ValidationError as exc:
-        return {"error": "invalid_request", "detail": exc.errors()}
+        raise HTTPException(
+            status_code=422,
+            detail={"reason": "invalid_request", "fields": _clean_validation_detail(exc)},
+        ) from exc
 
     result = investigate(request.text)
     return _serialize(result)
