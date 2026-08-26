@@ -31,3 +31,6 @@ runs/
 
 # Scratch research notes — not part of the submission
 research_dump/
+
+# Unrelated tool debris that has occasionally landed in this directory
+tmp/
