@@ -18,6 +18,8 @@ insufficient evidence. The model proposes; the ledger disposes.
 
 from __future__ import annotations
 
+import re
+
 import boto3
 from strands import Agent
 from strands.models import BedrockModel
@@ -40,6 +42,7 @@ from .tools.evidence import (
     fetch_official_page,
     report_fetch_ledger,
     reset_context,
+    set_official_domain,
 )
 
 # --------------------------------------------------------------------------
@@ -113,12 +116,21 @@ Method:
   1. Work out the organization's real official domain from your own knowledge \
 of the organization — never from the message. If you are unsure of the domain, \
 say so rather than guessing at a plausible-looking one.
-  2. Use fetch_official_page on that organization's own pages — its security, \
-fraud, scam-alert, contact, or policy pages are the highest-value targets.
-  3. If the message contained a visible hostname, use \
-compare_hostname_to_domain against the official domain you identified.
-  4. Before you finish, call report_fetch_ledger and confirm which evidence IDs \
-actually exist.
+  2. Call set_official_domain with that organization and domain before doing \
+anything else. This locks it for the rest of the investigation: \
+fetch_official_page and compare_hostname_to_domain both refuse to run until \
+you have, and neither can be pointed at a different domain afterward. If the \
+message plausibly involves more than one organization, lock the one the \
+requested action is actually about and note the other as a limitation later — \
+do not try to switch domains partway through.
+  3. Use fetch_official_page on that locked domain's own pages — its security, \
+fraud, scam-alert, contact, or policy pages are the highest-value targets. A \
+URL on a different domain will be refused before any request is made.
+  4. If the message contained a visible hostname, use \
+compare_hostname_to_domain to check it against the locked domain.
+  5. Before you finish, call report_fetch_ledger and confirm which evidence IDs \
+actually exist and which are first-party — that status is decided by the \
+domain lock, not by anything you write afterward.
 
 Your fetch budget is small and enforced in code. Spend it on first-party pages. \
 A government or regulator advisory is worth a fetch when the organization \
@@ -235,7 +247,12 @@ def build_investigator_agent() -> Agent:
     return Agent(
         model=_model(REASONING_MODEL, temperature=0.2),
         system_prompt=_INVESTIGATOR_PROMPT,
-        tools=[fetch_official_page, compare_hostname_to_domain, report_fetch_ledger],
+        tools=[
+            set_official_domain,
+            fetch_official_page,
+            compare_hostname_to_domain,
+            report_fetch_ledger,
+        ],
         name="investigator",
         description="Retrieves first-party evidence about a message's claims.",
     )
@@ -256,40 +273,110 @@ def build_synthesis_agent() -> Agent:
 # --------------------------------------------------------------------------
 
 
-def _enforce_citations(card: EvidenceCard, retrieved: set[str]) -> EvidenceCard:
-    """Drop cited evidence that was never actually retrieved.
+_CITATION_ID = re.compile(r"\(E\d+\)")
 
-    The model can hallucinate a citation. The fetch ledger cannot. Where they
-    disagree, the ledger wins: unretrieved evidence is removed, any claim
-    assessment resting on it is demoted, and a verdict that depended on it
-    falls back to insufficient evidence.
+
+def _cited_ids(text: str) -> set[str]:
+    return {m.strip("()") for m in _CITATION_ID.findall(text)}
+
+
+def _enforce_citations(card: EvidenceCard) -> EvidenceCard:
+    """Verify every citation against the ledger. Nothing here trusts the model.
+
+    A citation only survives if ALL of the following hold, checked against the
+    fetch ledger built during investigation, not against anything the model
+    wrote in the card:
+
+      - the evidence_id was actually fetched (not a phantom ID);
+      - the cited source_url matches what was actually fetched at that ID
+        (either the requested URL or the post-redirect final URL);
+      - the fetch succeeded (HTTP status < 400) — a 404 cannot be cited as
+        page content, even under a real evidence ID;
+      - quoted_text appears verbatim (whitespace-normalized) in the text that
+        was actually retrieved for that ID — a real ID reused with an
+        invented quotation is stripped, not trusted;
+      - is_first_party and source_controller are overwritten from the domain
+        lock recorded during investigation, never taken from the card as
+        written, since those are exactly the fields a model could otherwise
+        assert without any check.
+
+    Anything that fails is removed, not corrected — a partially-fabricated
+    citation is still fabricated. Claim assessments and free-text
+    verified_facts that cite a dropped ID are stripped in turn, and a verdict
+    that depends on evidence-backed citations is downgraded if nothing
+    survives.
     """
-    real_ids = {
-        item["evidence_id"] for item in current_context().fetch_log
-    }
+    context = current_context()
+    ledger_by_id = {entry["evidence_id"]: entry for entry in context.fetch_log}
 
-    kept = [e for e in card.evidence if e.evidence_id in real_ids]
-    card.evidence = kept
+    verified_ids: set[str] = set()
+    kept_evidence = []
 
-    # Claim assessments are pruned unconditionally, not only when an evidence
-    # item was dropped: a card can cite a phantom ID in an assessment while
-    # every item in its evidence list is genuine.
+    for item in card.evidence:
+        entry = ledger_by_id.get(item.evidence_id)
+        if entry is None:
+            continue  # phantom ID: no fetch with this ID ever happened
+
+        if item.source_url not in (entry["url"], entry["final_url"]):
+            continue  # cited URL doesn't match what was actually fetched at this ID
+
+        if int(entry["status"]) >= 400:
+            continue  # a failed fetch is not citable page content
+
+        real_text = context.evidence_text.get(item.evidence_id, "")
+        normalized_quote = " ".join(item.quoted_text.split())
+        normalized_real = " ".join(real_text.split())
+        if not normalized_quote or normalized_quote not in normalized_real:
+            continue  # quote is not verifiably present in what was retrieved
+
+        # Deterministic, not model-asserted: this is the entire point of the
+        # domain lock in tools/evidence.py.
+        item.is_first_party = bool(entry["is_first_party"])
+        item.source_controller = (
+            context.official_domain if item.is_first_party else "unverified"
+        )
+
+        verified_ids.add(item.evidence_id)
+        kept_evidence.append(item)
+
+    card.evidence = kept_evidence
+
     for assessment in card.claim_assessments:
-        surviving = [i for i in assessment.supporting_evidence_ids if i in real_ids]
+        surviving = [i for i in assessment.supporting_evidence_ids if i in verified_ids]
         if surviving != assessment.supporting_evidence_ids:
             assessment.supporting_evidence_ids = surviving
             if not surviving:
                 assessment.rationale += (
-                    " [Citation removed: the referenced evidence was not "
-                    "retrieved during this investigation.]"
+                    " [Citation removed: could not be verified against the "
+                    "fetch ledger, the retrieved text, or the locked official "
+                    "domain.]"
                 )
 
+    # verified_facts is free text with inline "(E<n>)" markers, not a
+    # structured field — parse those markers out and hold each fact to the
+    # same standard as a structured citation. A fact citing zero surviving
+    # IDs was never actually verified, whatever the model called it.
+    surviving_facts = []
+    any_fact_dropped = False
+    for fact in card.verified_facts:
+        cited = _cited_ids(fact)
+        if cited and not cited & verified_ids:
+            any_fact_dropped = True
+            continue
+        surviving_facts.append(fact)
+    card.verified_facts = surviving_facts
+
     evidence_backed = {Verdict.OFFICIAL_CONTRADICTION, Verdict.KNOWN_MALICIOUS}
-    if card.verdict in evidence_backed and not kept:
+    if card.verdict in evidence_backed and not kept_evidence:
         card.verdict = Verdict.INSUFFICIENT_EVIDENCE
         card.unresolved.append(
-            "A verdict was proposed on evidence that could not be confirmed as "
-            "retrieved, so it was withdrawn."
+            "A verdict was proposed on evidence that could not be verified "
+            "against the fetch ledger, so it was withdrawn."
+        )
+    if any_fact_dropped:
+        card.unresolved.append(
+            "One or more claimed facts cited evidence that failed "
+            "verification and were removed."
         )
 
     return card
@@ -377,6 +464,6 @@ ACTUAL RETRIEVED PAGE TEXT (quote from here, never from the notes above):
         limits=SYNTHESIS_BUDGET.as_limits(),
     )
     card: EvidenceCard = card_result.structured_output
-    card = _enforce_citations(card, context.retrieved_urls())
+    card = _enforce_citations(card)
 
     return {"investigated": True, "triage": triage, "card": card}

@@ -160,19 +160,27 @@ class EvidenceItem(BaseModel):
     source_controller: str = Field(
         description=(
             "The entity that controls this domain, e.g. 'Canada Post' or "
-            "'Government of Canada'. This is what makes evidence first-party."
+            "'Government of Canada'. This is what makes evidence first-party. "
+            "The pipeline overwrites this after synthesis from the domain lock "
+            "recorded during investigation — fill it in as your best answer, "
+            "but do not expect this field to be trusted as written."
         )
     )
     is_first_party: bool = Field(
         description=(
             "True only if source_controller is the same organization the "
-            "message claims to be from."
+            "message claims to be from. The pipeline overwrites this after "
+            "synthesis based on whether the fetch actually matched the locked "
+            "official domain — it is not taken from this field as written."
         )
     )
     quoted_text: str = Field(
         description=(
             "A bounded verbatim excerpt (max ~300 chars) from the page that "
-            "bears on a claim. Never a paraphrase."
+            "bears on a claim. Never a paraphrase. Checked against the actual "
+            "retrieved text after synthesis; a quote that cannot be found "
+            "verbatim in what was really fetched causes this entire evidence "
+            "item to be dropped from the card, not silently corrected."
         )
     )
     retrieved_at: str = Field(description="ISO-8601 UTC retrieval timestamp.")

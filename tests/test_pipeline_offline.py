@@ -43,58 +43,168 @@ def _card(**overrides) -> EvidenceCard:
     return EvidenceCard(**base)
 
 
-def _evidence(evidence_id: str, url: str) -> EvidenceItem:
+_REAL_QUOTE = "We will never request payment by text message."
+
+
+def _evidence(
+    evidence_id: str,
+    url: str,
+    quoted_text: str = _REAL_QUOTE,
+    is_first_party: bool = True,
+    source_controller: str = "Canada Post",
+) -> EvidenceItem:
     return EvidenceItem(
         evidence_id=evidence_id,
         source_url=url,
-        source_controller="Canada Post",
-        is_first_party=True,
-        quoted_text="We will never request payment by text message.",
+        source_controller=source_controller,
+        is_first_party=is_first_party,
+        quoted_text=quoted_text,
         retrieved_at="2026-08-20T12:00:00+00:00",
     )
 
 
 class TestCitationEnforcement(unittest.TestCase):
-    """The fetch ledger, not the model, decides what evidence exists."""
+    """The fetch ledger, not the model, decides what evidence exists.
+
+    These specifically cover the gap a reviewer found in an earlier version:
+    the old check only confirmed an evidence_id had been fetched *at some
+    point*, so a fabricated quotation and a fabricated URL both survived as
+    long as they reused a real ID — even an ID that represented a 404. Every
+    class of that forgery gets its own test below, named for the forgery it
+    blocks.
+    """
 
     def setUp(self) -> None:
-        reset_context()
+        self.context = reset_context()
+        self.context.official_domain = "canadapost.ca"
+        self.context.claimed_organization = "Canada Post"
 
     def test_genuine_citation_survives(self) -> None:
-        context = reset_context()
-        context.record("https://canadapost.ca/fraud", "https://canadapost.ca/fraud", 200)
+        self.context.record(
+            "https://canadapost.ca/fraud", "https://canadapost.ca/fraud", 200,
+            text=_REAL_QUOTE, is_first_party=True,
+        )
 
         card = _card(evidence=[_evidence("E1", "https://canadapost.ca/fraud")])
-        result = _enforce_citations(card, context.retrieved_urls())
+        result = _enforce_citations(card)
 
         self.assertEqual(len(result.evidence), 1)
         self.assertEqual(result.verdict, Verdict.OFFICIAL_CONTRADICTION)
 
-    def test_hallucinated_evidence_is_stripped(self) -> None:
-        """A citation to a page never fetched must not survive."""
-        context = reset_context()  # nothing fetched
-
+    def test_hallucinated_evidence_id_is_stripped(self) -> None:
+        """A citation to an ID that was never fetched at all must not survive."""
         card = _card(evidence=[_evidence("E1", "https://canadapost.ca/invented")])
-        result = _enforce_citations(card, context.retrieved_urls())
+        result = _enforce_citations(card)
 
         self.assertEqual(result.evidence, [])
 
+    def test_fabricated_quote_on_a_real_id_is_stripped(self) -> None:
+        """The exact reviewer-reported gap: a real ID, but an invented quote.
+
+        E1 really was fetched and really does contain text — just not the
+        text the card claims to quote from it.
+        """
+        self.context.record(
+            "https://canadapost.ca/fraud", "https://canadapost.ca/fraud", 200,
+            text="Canada Post never asks for banking information by SMS.",
+            is_first_party=True,
+        )
+
+        card = _card(
+            verdict=Verdict.OFFICIAL_CONTRADICTION,
+            evidence=[_evidence(
+                "E1", "https://canadapost.ca/fraud",
+                quoted_text="Canada Post confirms this $2.99 fee is legitimate.",
+            )],
+        )
+        result = _enforce_citations(card)
+
+        self.assertEqual(result.evidence, [])
+        self.assertEqual(result.verdict, Verdict.INSUFFICIENT_EVIDENCE)
+
+    def test_citation_against_a_404_is_stripped_even_with_a_real_id(self) -> None:
+        """The other half of the reviewer's repro: reusing an ID that exists
+        in the ledger, but represents a failed fetch with no real content."""
+        self.context.record(
+            "https://canadapost.ca/gone", "https://canadapost.ca/gone", 404,
+            is_first_party=True,
+        )
+
+        card = _card(
+            verdict=Verdict.OFFICIAL_CONTRADICTION,
+            evidence=[_evidence(
+                "E1", "https://canadapost.ca/gone",
+                quoted_text="Canada Post confirms this $2.99 fee is legitimate.",
+            )],
+        )
+        result = _enforce_citations(card)
+
+        self.assertEqual(result.evidence, [])
+        self.assertEqual(result.verdict, Verdict.INSUFFICIENT_EVIDENCE)
+
+    def test_citation_with_mismatched_url_is_stripped(self) -> None:
+        """A real, successful fetch at E1 -- but the card cites E1 while
+        claiming a different source_url than what was actually fetched."""
+        self.context.record(
+            "https://canadapost.ca/fraud", "https://canadapost.ca/fraud", 200,
+            text=_REAL_QUOTE, is_first_party=True,
+        )
+
+        card = _card(evidence=[_evidence("E1", "https://canadapost.ca/totally-different-page")])
+        result = _enforce_citations(card)
+
+        self.assertEqual(result.evidence, [])
+
+    def test_url_citation_accepts_either_requested_or_final_redirect_url(self) -> None:
+        """Not a forgery: citing the post-redirect URL for a fetch that
+        redirected must still be accepted."""
+        self.context.record(
+            "https://canadapost.ca/old-path",
+            "https://www.canadapost-postescanada.ca/new-path",
+            200, text=_REAL_QUOTE, is_first_party=True,
+        )
+
+        card = _card(evidence=[_evidence(
+            "E1", "https://www.canadapost-postescanada.ca/new-path",
+        )])
+        result = _enforce_citations(card)
+
+        self.assertEqual(len(result.evidence), 1)
+
+    def test_is_first_party_and_controller_are_overridden_not_trusted(self) -> None:
+        """The model can claim whatever it wants in these two fields; the
+        ledger's domain-lock result is what actually lands in the card."""
+        self.context.record(
+            "https://canadapost.ca/fraud", "https://canadapost.ca/fraud", 200,
+            text=_REAL_QUOTE, is_first_party=False,  # e.g. redirected off-domain
+        )
+
+        card = _card(evidence=[_evidence(
+            "E1", "https://canadapost.ca/fraud",
+            is_first_party=True, source_controller="Canada Post",  # the model's (wrong) claim
+        )])
+        result = _enforce_citations(card)
+
+        self.assertEqual(len(result.evidence), 1)
+        self.assertFalse(result.evidence[0].is_first_party)
+        self.assertEqual(result.evidence[0].source_controller, "unverified")
+
     def test_verdict_downgrades_when_its_evidence_vanishes(self) -> None:
         """An evidence-backed verdict cannot stand on stripped evidence."""
-        context = reset_context()  # nothing fetched
-
         card = _card(
             verdict=Verdict.OFFICIAL_CONTRADICTION,
             evidence=[_evidence("E1", "https://canadapost.ca/invented")],
         )
-        result = _enforce_citations(card, context.retrieved_urls())
+        result = _enforce_citations(card)
 
         self.assertEqual(result.verdict, Verdict.INSUFFICIENT_EVIDENCE)
         self.assertTrue(result.unresolved, "downgrade must explain itself")
 
     def test_claim_assessment_loses_phantom_support(self) -> None:
-        context = reset_context()
-        context.record("https://canadapost.ca/fraud", "https://canadapost.ca/fraud", 200)
+        self.context.record(
+            "https://canadapost.ca/fraud", "https://canadapost.ca/fraud", 200,
+            text=_REAL_QUOTE, is_first_party=True,
+        )
 
         card = _card(
             evidence=[_evidence("E1", "https://canadapost.ca/fraud")],
@@ -107,16 +217,39 @@ class TestCitationEnforcement(unittest.TestCase):
                 )
             ],
         )
-        result = _enforce_citations(card, context.retrieved_urls())
+        result = _enforce_citations(card)
 
         self.assertEqual(result.claim_assessments[0].supporting_evidence_ids, ["E1"])
 
+    def test_verified_fact_citing_a_failed_fetch_is_dropped(self) -> None:
+        """verified_facts is free text with inline (E<n>) markers, not a
+        structured field -- it must be held to the same standard."""
+        self.context.record(
+            "https://canadapost.ca/gone", "https://canadapost.ca/gone", 404,
+            is_first_party=True,
+        )
+
+        card = _card(verified_facts=["Canada Post confirms this fee is standard (E1)."])
+        result = _enforce_citations(card)
+
+        self.assertEqual(result.verified_facts, [])
+        self.assertTrue(
+            any("failed verification" in u for u in result.unresolved),
+            result.unresolved,
+        )
+
+    def test_verified_fact_with_no_citation_is_left_alone(self) -> None:
+        """A fact with no (E<n>) marker at all isn't a citation claim and
+        shouldn't be touched by citation enforcement."""
+        card = _card(verified_facts=["The message uses a .xyz domain."])
+        result = _enforce_citations(card)
+
+        self.assertEqual(result.verified_facts, ["The message uses a .xyz domain."])
+
     def test_suspicious_verdict_survives_without_evidence(self) -> None:
         """Behavioural suspicion needs no citation, so it must not downgrade."""
-        context = reset_context()
-
         card = _card(verdict=Verdict.SUSPICIOUS_UNCONFIRMED, evidence=[])
-        result = _enforce_citations(card, context.retrieved_urls())
+        result = _enforce_citations(card)
 
         self.assertEqual(result.verdict, Verdict.SUSPICIOUS_UNCONFIRMED)
 
