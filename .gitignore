@@ -38,3 +38,6 @@ research_dump/
 
 # Unrelated tool debris that has occasionally landed in this directory
 tmp/
+
+# Ad-hoc debugging scripts/output, never meant to be committed
+scratch_*
