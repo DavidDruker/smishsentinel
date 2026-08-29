@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -146,18 +147,19 @@ class TestRendering(unittest.TestCase):
         self.assertIn("&lt;script&gt;", page)
 
 
-class TestLiveServer(unittest.TestCase):
-    """A real request/response round trip against the stdlib HTTP server,
-    bound to loopback only."""
+class _LiveServerCase(unittest.TestCase):
+    """Shared scaffolding for tests that need a real running server bound to
+    loopback -- not itself a test case (no test_ methods), just the setup
+    TestLiveServer and TestInvestigateEndpoint both build on."""
 
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmpdir.cleanup)
-        store = CaseStore(base_dir=self.tmpdir.name)
+        self.store = CaseStore(base_dir=self.tmpdir.name)
         record = _investigated_record()
-        store.save(record)
+        self.store.save(record)
         self.record = record
-        self.server = make_app(store=store, port=0)  # port=0 -> OS picks a free port
+        self.server = make_app(store=self.store, port=0)  # port=0 -> OS picks a free port
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -174,6 +176,20 @@ class TestLiveServer(unittest.TestCase):
                 return resp.status, resp.read()
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
+
+    def _post(self, path: str, body: bytes = b"", content_type: str = "application/json") -> tuple[int, bytes]:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}", data=body, method="POST",
+            headers={"Content-Type": content_type},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+
+class TestLiveServer(_LiveServerCase):
+    """A real request/response round trip against the stdlib HTTP server."""
 
     def test_index_page_lists_the_seeded_case(self) -> None:
         status, body = self._get("/")
@@ -195,6 +211,75 @@ class TestLiveServer(unittest.TestCase):
     def test_unknown_case_is_a_404(self) -> None:
         status, _ = self._get("/case/case-doesnotexist")
         self.assertEqual(status, 404)
+
+
+class TestInvestigateEndpoint(_LiveServerCase):
+    """POST /investigate -- the custom-message path. investigate() is
+    mocked, same reasoning as test_inbox_pipeline.py: it needs live
+    Bedrock, and what's under test here is the HTTP/validation/persistence
+    layer around it, not the model's judgment."""
+
+    def _wait_for_status(self, case_id: str, status: str, timeout: float = 5) -> CaseRecord:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            record = self.store.get(case_id)
+            if record is not None and record.status.value == status:
+                return record
+            time.sleep(0.02)
+        self.fail(f"case {case_id} did not reach status={status!r} within {timeout}s")
+
+    def test_persists_immediately_and_completes_in_the_background(self) -> None:
+        card = mock.Mock(risk_level=RiskLevel.HIGH)
+        card.model_dump.return_value = {"headline": "Do not click.", "verdict": "suspicious_unconfirmed"}
+        triage = TriageResult(
+            warrants_investigation=True, claimed_organization="Acme",
+            requested_action=RequestedAction.CLICK_LINK, urgency_signals=[],
+            visible_hostname=None, reasoning="test",
+        )
+        # The mock must stay active for the whole background-thread window,
+        # not just for _post() -- investigate_one_message() runs in a thread
+        # started by the request handler, which can easily still be running
+        # (or not yet started) after _post() returns and an outer `with`
+        # would already have unpatched investigate() back to the real,
+        # live-Bedrock-calling function. Losing this race once during
+        # development made a real model call from what should be a fully
+        # offline test -- keeping _wait_for_status inside the patch is what
+        # actually closes that gap, not just tidiness.
+        with mock.patch("smishsentinel.inbox.investigate") as mock_investigate:
+            mock_investigate.return_value = {"investigated": True, "triage": triage, "card": card}
+            status, body = self._post(
+                "/investigate", json.dumps({"message": "a suspicious message"}).encode()
+            )
+            self.assertEqual(status, 202)
+            case_id = json.loads(body)["case_id"]
+            # Persisted synchronously -- present the instant the response comes back.
+            self.assertIsNotNone(self.store.get(case_id))
+            record = self._wait_for_status(case_id, "complete")
+
+        self.assertEqual(record.notification.channel.value, "urgent")
+        self.assertEqual(record.card["headline"], "Do not click.")
+
+    def test_rejects_blank_message(self) -> None:
+        status, body = self._post("/investigate", json.dumps({"message": "   "}).encode())
+        self.assertEqual(status, 422)
+        self.assertIn("error", json.loads(body))
+
+    def test_rejects_missing_message_field(self) -> None:
+        status, _ = self._post("/investigate", json.dumps({}).encode())
+        self.assertEqual(status, 422)
+
+    def test_rejects_non_string_message(self) -> None:
+        status, _ = self._post("/investigate", json.dumps({"message": ["not", "a", "string"]}).encode())
+        self.assertEqual(status, 422)
+
+    def test_rejects_oversized_message(self) -> None:
+        status, _ = self._post("/investigate", json.dumps({"message": "x" * 5000}).encode())
+        self.assertEqual(status, 422)
+
+    def test_rejects_invalid_json_body(self) -> None:
+        status, body = self._post("/investigate", b"not json")
+        self.assertEqual(status, 400)
+        self.assertIn("error", json.loads(body))
 
 
 if __name__ == "__main__":

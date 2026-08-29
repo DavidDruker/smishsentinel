@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from smishsentinel.inbox import run_inbox_cycle
+from smishsentinel.inbox import investigate_one_message, run_inbox_cycle
 from smishsentinel.notify import decide, deliver, verify_delivered, verify_notification_sent
 from smishsentinel.schemas import RequestedAction, RiskLevel, TriageResult, Verdict
 from smishsentinel.store import CaseRecord, CaseStatus, CaseStore, NotificationChannel, new_case_id
@@ -171,6 +171,50 @@ class TestDeliveryAndVerification(unittest.TestCase):
         record = self._record(CaseStatus.COMPLETE)
         record.notification = deliver(record, NotificationChannel.URGENT)
         self.assertTrue(verify_notification_sent(record))
+
+
+class TestInvestigateOneMessage(unittest.TestCase):
+    """The per-message lifecycle run_inbox_cycle loops over, pulled out so a
+    caller with one specific message (webui.py's ad-hoc investigate form)
+    gets the same real lifecycle without faking up a one-item inbox."""
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.store = CaseStore(base_dir=self.tmpdir.name)
+
+    def tearDown(self) -> None:
+        self.tmpdir.cleanup()
+
+    def test_investigated_message_persists_and_notifies(self) -> None:
+        card = mock.Mock(risk_level=RiskLevel.HIGH)
+        card.model_dump.return_value = {"headline": "Do not click.", "verdict": Verdict.SUSPICIOUS_UNCONFIRMED.value}
+
+        with mock.patch("smishsentinel.inbox.investigate") as mock_investigate:
+            mock_investigate.return_value = {"investigated": True, "triage": _triage(True), "card": card}
+            record = investigate_one_message("suspicious message", self.store)
+
+        self.assertEqual(record.status, CaseStatus.COMPLETE)
+        self.assertEqual(record.notification.channel, NotificationChannel.URGENT)
+        self.assertTrue(verify_delivered(self.store.get(record.case_id)))
+
+    def test_accepts_a_caller_supplied_case_id(self) -> None:
+        with mock.patch("smishsentinel.inbox.investigate") as mock_investigate:
+            mock_investigate.return_value = {"investigated": False, "triage": _triage(False), "card": None}
+            record = investigate_one_message("hey, running late", self.store, case_id="case-fixed-id")
+
+        self.assertEqual(record.case_id, "case-fixed-id")
+        self.assertIsNotNone(self.store.get("case-fixed-id"))
+
+    def test_run_inbox_cycle_and_single_message_produce_the_same_shape(self) -> None:
+        """A regression guard on the refactor itself: run_inbox_cycle must
+        still behave identically now that it delegates to this function."""
+        with mock.patch("smishsentinel.inbox.investigate") as mock_investigate:
+            mock_investigate.return_value = {"investigated": False, "triage": _triage(False), "card": None}
+            [via_cycle] = run_inbox_cycle(messages=["hey, running late"], store=self.store)
+            via_direct = investigate_one_message("hey, running late", self.store)
+
+        self.assertEqual(via_cycle.status, via_direct.status)
+        self.assertEqual(via_cycle.notification.channel, via_direct.notification.channel)
 
 
 class TestInboxCycle(unittest.TestCase):

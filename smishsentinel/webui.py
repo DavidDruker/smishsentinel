@@ -7,7 +7,12 @@ The synthetic inbox and the offline pipeline were already real end to end
 (see inbox.py); what was missing was anything a person could actually look
 at. This is that: a small local web UI, judges run it themselves, that reads
 and writes the exact same ``CaseStore`` ``run_inbox_cycle()`` already uses --
-so what it shows is real persisted state, not a mock of one.
+so what it shows is real persisted state, not a mock of one. Beyond the
+fixed synthetic inbox, the inbox page also takes a message someone types in
+directly (``POST /investigate``) and runs it through the exact same
+lifecycle -- see ``investigate_one_message`` in inbox.py -- so a judge (or
+you, demoing this) can watch a message of their own choosing get
+investigated live, not only the five canned ones.
 
 Deliberately a separate process from ``app.py``, not more routes bolted onto
 it: ``app.py`` is the deployed AgentCore entrypoint, and its HTTP contract is
@@ -32,15 +37,21 @@ import html
 import json
 import os
 import threading
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 from urllib.parse import urlparse
 
-from .inbox import run_inbox_cycle
+from .inbox import investigate_one_message, run_inbox_cycle
 from .schemas import RiskLevel
-from .store import CaseRecord, CaseStore, DynamoDBCaseStore, get_case_store
+from .store import CaseRecord, CaseStatus, CaseStore, DynamoDBCaseStore, get_case_store, new_case_id
 
 _HOST = "127.0.0.1"
 _DEFAULT_PORT = int(os.environ.get("SMISH_WEBUI_PORT", "8090"))
+
+# Matches app.py's InvocationRequest limit -- the same "how much text is a
+# reasonable single SMS-scam message" judgment call, applied here too.
+_MAX_MESSAGE_LENGTH = 4000
 
 _STATUS_LABEL = {
     "received": "Received",
@@ -70,6 +81,10 @@ _RISK_CSS = {
 # Pure data-shaping helpers -- kept free of any HTTP/HTML concern so they're
 # directly unit-testable (see tests/test_webui.py).
 # --------------------------------------------------------------------------
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 def case_summary(record: CaseRecord) -> dict:
@@ -185,6 +200,17 @@ ul.evidence-list li:first-child { border-top: none; }
 .back-link { display: inline-block; margin-bottom: 16px; color: var(--muted); text-decoration: none; }
 .back-link:hover { color: var(--text); }
 .mono { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+.compose {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 16px 18px; margin-bottom: 20px;
+}
+.compose textarea {
+  width: 100%; min-height: 70px; resize: vertical; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; font: inherit;
+}
+.compose-row { display: flex; justify-content: flex-end; align-items: center; gap: 10px; margin-top: 10px; }
+.compose-error { color: var(--urgent); font-size: 13px; margin-right: auto; }
+.divider { text-align: center; color: var(--muted); font-size: 12px; margin: 24px 0 16px; text-transform: uppercase; letter-spacing: 0.04em; }
 """
 
 
@@ -233,9 +259,44 @@ def render_inbox_page(cases: list[dict]) -> str:
   <button id="run-btn" onclick="runCycle()">Run demo inbox cycle</button>
 </header>
 <main>
+  <div class="compose">
+    <textarea id="compose-text" maxlength="{_MAX_MESSAGE_LENGTH}"
+      placeholder="Paste or type a suspicious text message to investigate it live&hellip;"></textarea>
+    <div class="compose-row">
+      <span class="compose-error" id="compose-error"></span>
+      <button id="compose-btn" onclick="submitMessage()">Investigate this message</button>
+    </div>
+  </div>
+  <div class="divider">or watch the synthetic inbox</div>
   <div id="cases">{rows}</div>
 </main>
 <script>
+async function submitMessage() {{
+  const textarea = document.getElementById('compose-text');
+  const errorEl = document.getElementById('compose-error');
+  const btn = document.getElementById('compose-btn');
+  const message = textarea.value.trim();
+  errorEl.textContent = '';
+  if (!message) {{ errorEl.textContent = 'Type a message first.'; return; }}
+
+  btn.disabled = true;
+  btn.textContent = 'Submitting…';
+  try {{
+    const res = await fetch('/investigate', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{message}}),
+    }});
+    const data = await res.json();
+    if (!res.ok) {{ errorEl.textContent = data.error || 'Something went wrong.'; return; }}
+    window.location.href = '/case/' + data.case_id;
+  }} catch (e) {{
+    errorEl.textContent = 'Could not reach the server.';
+  }} finally {{
+    btn.disabled = false;
+    btn.textContent = 'Investigate this message';
+  }}
+}}
 async function runCycle() {{
   const btn = document.getElementById('run-btn');
   btn.disabled = true;
@@ -429,9 +490,16 @@ class _Handler(BaseHTTPRequestHandler):
 
         self._send_html(404, _page("Not found", "<main><p>Not found.</p></main>"))
 
+    def _read_json_body(self) -> Any:
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        raw = self.rfile.read(length) if length else b""
+        return json.loads(raw) if raw else {}
+
     def do_POST(self) -> None:  # noqa: N802 - stdlib method name
-        if urlparse(self.path).path == "/run-cycle":
-            store: CaseStore | DynamoDBCaseStore = self.server.store  # type: ignore[attr-defined]
+        path = urlparse(self.path).path
+        store: CaseStore | DynamoDBCaseStore = self.server.store  # type: ignore[attr-defined]
+
+        if path == "/run-cycle":
             # Fire-and-forget in a background thread: run_inbox_cycle persists
             # each case at every stage transition, so the polling UI sees
             # investigations happen live rather than only after they finish.
@@ -440,6 +508,46 @@ class _Handler(BaseHTTPRequestHandler):
             threading.Thread(target=run_inbox_cycle, kwargs={"store": store}, daemon=True).start()
             self._send_json(202, {"started": True})
             return
+
+        if path == "/investigate":
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError:
+                self._send_json(400, {"error": "invalid JSON body"})
+                return
+
+            message = body.get("message") if isinstance(body, dict) else None
+            if not isinstance(message, str) or not message.strip():
+                self._send_json(422, {"error": "message must be a non-empty string"})
+                return
+            message = message.strip()
+            if len(message) > _MAX_MESSAGE_LENGTH:
+                self._send_json(
+                    422, {"error": f"message exceeds the {_MAX_MESSAGE_LENGTH}-character limit"}
+                )
+                return
+
+            # Save a RECEIVED record synchronously, before returning, so the
+            # page this redirects to always finds a real case -- not a 404
+            # raced against the background thread's own first save.
+            # investigate_one_message() still does its own save immediately
+            # after (it always starts a case fresh at RECEIVED); the two
+            # near-simultaneous writes to the same case_id are what
+            # CaseStore.save()'s unique-tmp-filename-plus-retry handles.
+            case_id = new_case_id()
+            store.save(CaseRecord(
+                case_id=case_id, received_at=_now(),
+                status=CaseStatus.RECEIVED, message_text=message,
+            ))
+            threading.Thread(
+                target=investigate_one_message,
+                args=(message, store),
+                kwargs={"case_id": case_id},
+                daemon=True,
+            ).start()
+            self._send_json(202, {"case_id": case_id})
+            return
+
         self._send_json(404, {"error": "not found"})
 
 

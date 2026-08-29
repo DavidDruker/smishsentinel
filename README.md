@@ -50,9 +50,12 @@ afterward:
 demo populates:
 ```bash
 python -m smishsentinel.webui
-# open http://127.0.0.1:8090/, click "Run demo inbox cycle"
+# open http://127.0.0.1:8090/
 ```
-Inbox message → background investigation → quiet-or-surfaced status →
+Type or paste any message into the box and click "Investigate this
+message" to watch it move through the real pipeline live, or click "Run
+demo inbox cycle" to see the fixed synthetic inbox instead. Either way:
+inbox message → background investigation → quiet-or-surfaced status →
 evidence card with clickable, independently-fetched sources → a safe next
 action. Most messages stay quiet on purpose; only consequential cases
 surface with a colored badge. See [`webui.py`](smishsentinel/webui.py) for
@@ -266,7 +269,7 @@ smishsentinel/
   webui.py                      Local demo UI: inbox -> evidence card -> safe action (stdlib-only)
   tools/evidence.py             Fetch, hostname comparison, and the domain-lock enforcement
 data/organizations.json         The registry's data: ~15 curated organizations and their domains
-tests/                          128 tests; everything except the live-only smoke test runs offline
+tests/                          137 tests; everything except the live-only smoke test runs offline
   fakes.py                      Injectable fake agents + recorded page fixtures, not a test file itself
 ARCHITECTURE.md                 Diagrams and the reasoning behind the agent/tool split
 docs/agentcore-iam-bootstrap-policy.json           IAM policy for the deploying user (auto-role-creation)

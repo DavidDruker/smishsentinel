@@ -62,6 +62,60 @@ SYNTHETIC_INBOX: list[str] = [
 ]
 
 
+def investigate_one_message(
+    message: str,
+    store: CaseStore | DynamoDBCaseStore,
+    *,
+    case_id: str | None = None,
+) -> CaseRecord:
+    """Run a single message through the full lifecycle: received ->
+    investigating -> complete/failed, persisted at every stage transition
+    rather than only at the end.
+
+    This is the per-message body ``run_inbox_cycle`` loops over, pulled out
+    so a caller that already has one specific message in hand -- webui.py's
+    "investigate this message" form, for instance -- gets the exact same
+    real lifecycle, persistence, and notify-or-suppress decision without
+    faking up a one-item inbox to get it.
+    """
+    record = CaseRecord(
+        case_id=case_id or new_case_id(),
+        received_at=_now(),
+        status=CaseStatus.RECEIVED,
+        message_text=message,
+    )
+    store.save(record)
+
+    record.status = CaseStatus.INVESTIGATING
+    store.save(record)
+
+    try:
+        result = investigate(message)
+    except Exception as exc:  # noqa: BLE001 - a failed case is a real, visible outcome, not a crash
+        record.status = CaseStatus.FAILED
+        record.error = f"{type(exc).__name__}: {exc}"
+        # A failure that never notifies anyone is worse than a wrong
+        # verdict -- the user is left thinking the message was checked
+        # when it silently wasn't. Treated as urgent for the same reason
+        # notify.decide treats a missing card as urgent: a defensive
+        # default matters more than an elegant one.
+        record.notification = deliver(record, NotificationChannel.URGENT)
+        store.save(record)
+        return record
+
+    triage: TriageResult = result["triage"]
+    card = result["card"]
+
+    record.triage = triage.model_dump(mode="json")
+    record.card = card.model_dump(mode="json") if card else None
+
+    channel = decide(triage, card)
+    record.notification = deliver(record, channel)
+    record.status = CaseStatus.COMPLETE
+    store.save(record)
+    return record
+
+
 def run_inbox_cycle(
     messages: list[str] | None = None,
     store: CaseStore | DynamoDBCaseStore | None = None,
@@ -89,15 +143,14 @@ def run_inbox_cycle(
     start = time.monotonic()
 
     for message in messages if messages is not None else SYNTHETIC_INBOX:
-        record = CaseRecord(
-            case_id=new_case_id(),
-            received_at=_now(),
-            status=CaseStatus.RECEIVED,
-            message_text=message,
-        )
-        store.save(record)
-
         if time.monotonic() - start > deadline_seconds:
+            record = CaseRecord(
+                case_id=new_case_id(),
+                received_at=_now(),
+                status=CaseStatus.RECEIVED,
+                message_text=message,
+            )
+            store.save(record)
             record.status = CaseStatus.FAILED
             record.error = (
                 f"Cycle deadline of {deadline_seconds}s exceeded before this "
@@ -108,35 +161,7 @@ def run_inbox_cycle(
             records.append(record)
             continue
 
-        record.status = CaseStatus.INVESTIGATING
-        store.save(record)
-
-        try:
-            result = investigate(message)
-        except Exception as exc:  # noqa: BLE001 - a failed case is a real, visible outcome, not a crash
-            record.status = CaseStatus.FAILED
-            record.error = f"{type(exc).__name__}: {exc}"
-            # A failure that never notifies anyone is worse than a wrong
-            # verdict -- the user is left thinking the message was checked
-            # when it silently wasn't. Treated as urgent for the same reason
-            # notify.decide treats a missing card as urgent: a defensive
-            # default matters more than an elegant one.
-            record.notification = deliver(record, NotificationChannel.URGENT)
-            store.save(record)
-            records.append(record)
-            continue
-
-        triage: TriageResult = result["triage"]
-        card = result["card"]
-
-        record.triage = triage.model_dump(mode="json")
-        record.card = card.model_dump(mode="json") if card else None
-
-        channel = decide(triage, card)
-        record.notification = deliver(record, channel)
-        record.status = CaseStatus.COMPLETE
-        store.save(record)
-        records.append(record)
+        records.append(investigate_one_message(message, store))
 
     return records
 

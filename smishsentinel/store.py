@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -134,10 +135,31 @@ class CaseStore:
         path = self._path(record.case_id)
         # Write-then-rename: a reader never observes a half-written file, and
         # a crash mid-write leaves the previous version intact rather than a
-        # corrupt one.
-        tmp_path = path.with_suffix(".json.tmp")
+        # corrupt one. The tmp filename carries a random suffix, not just the
+        # case_id, so two callers saving the same case_id in close succession
+        # -- e.g. webui.py's request handler persisting a fresh RECEIVED
+        # record just before the background thread it starts saves its own
+        # -- never share one tmp file and clobber each other's write
+        # mid-flight; each writes and renames its own.
+        tmp_path = path.with_suffix(f".{uuid.uuid4().hex[:8]}.tmp")
         tmp_path.write_text(json.dumps(record.to_json_dict(), indent=2), encoding="utf-8")
-        tmp_path.replace(path)
+
+        # os.replace (MoveFileExW on Windows) can transiently raise
+        # PermissionError/WinError 5 when the destination was just created
+        # a moment ago and is still momentarily held by real-time antivirus
+        # or search indexing -- observed in practice from exactly the
+        # concurrent-save pattern above. Retried briefly rather than treated
+        # as fatal: it clears within milliseconds, and this is a local file,
+        # not a real permissions problem. A no-op on platforms that don't
+        # exhibit this (the first attempt always succeeds there).
+        for attempt in range(5):
+            try:
+                tmp_path.replace(path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
 
     def get(self, case_id: str) -> CaseRecord | None:
         path = self._path(case_id)
