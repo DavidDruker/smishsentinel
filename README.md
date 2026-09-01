@@ -311,6 +311,15 @@ Stated plainly rather than left for a judge to discover:
   untrusted-content wrapping) are each tested directly. This is not
   systematic red-teaming or a jailbreak corpus against the live model.
 
+## Development note
+
+Built during the hackathon submission period using Claude Code as an AI
+coding assistant throughout — the pipeline, tools, tests, documentation, and
+deployment configuration were all written fresh for this submission, not
+adapted from a pre-existing project. Third-party dependencies (the Strands
+Agents SDK, boto3, Bedrock/AgentCore, pydantic, starlette) are standard
+tools, not incorporated prior work.
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).

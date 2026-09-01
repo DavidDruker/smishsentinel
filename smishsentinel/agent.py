@@ -78,9 +78,21 @@ Set warrants_investigation to true only when BOTH hold:
   - it asks the recipient to do something consequential (click, call, pay, \
 reply with data, share a code, install something, or move to another channel).
 
-Ordinary messages — a delivery notice with no action, a marketing blast, a \
-personal message, a plain notification — end here. Staying silent is the \
-correct and common outcome; do not manufacture concern to justify work.
+These two checks are a literal pattern match, not a judgment call about how \
+risky, routine, or legitimate the message feels. Do not ask yourself whether \
+the requested action "seems like ordinary commercial activity" or "sounds \
+like a real scam" — answering that would require knowing whether the \
+organization's claim and its link are genuine, which is exactly what you \
+have no way to check and are not asking yourself here. If an organization is \
+named and the action matches one of the verbs above, investigation is \
+warranted regardless of how mundane, official, or harmless the message \
+appears — that judgment belongs to the investigation stage, which can \
+actually verify it, not to you.
+
+Ordinary messages — a delivery notice with no action, a marketing blast with \
+no named organization, a personal message, a plain notification — end here. \
+Staying silent is the correct and common outcome; do not manufacture concern \
+to justify work.
 
 Extract the visible hostname literally if a link is present. Do not resolve, \
 expand, guess at, or follow it.
