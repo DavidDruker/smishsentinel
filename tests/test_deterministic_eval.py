@@ -36,6 +36,7 @@ from smishsentinel.schemas import (
     EvidenceCard,
     EvidenceItem,
     ExtractedClaim,
+    MLScreeningResult,
     RequestedAction,
     RiskLevel,
     TriageResult,
@@ -274,6 +275,94 @@ class TestDeterministicEndToEnd(unittest.TestCase):
         self.assertEqual(result["card"].verdict, Verdict.INSUFFICIENT_EVIDENCE)
         self.assertEqual(result["card"].evidence, [])
         self.mock_fetch.assert_not_called()
+
+
+class TestMLScreeningPath(unittest.TestCase):
+    """The fifth path, alongside the four-stage pipeline above: a message
+    that fails triage's gate (no identifiable organization + consequential
+    action together) goes to the ML screener instead of ending unconditionally
+    -- see agent.py's module docstring and ml_screen.py. Uses a fake screener,
+    not the real trained artifact, so this proves investigate()'s wiring
+    rather than the model's judgment (that's tests/test_ml_screen.py's job)."""
+
+    _NO_ORG_MESSAGE = "You have WON a guaranteed cash prize! Call 09051234567 now to claim, offer ends today."
+
+    def _triage_declined(self) -> TriageResult:
+        return TriageResult(
+            warrants_investigation=False,
+            claimed_organization=None,
+            requested_action=RequestedAction.CALL_NUMBER,
+            urgency_signals=["offer ends today"],
+            visible_hostname=None,
+            reasoning="No organization is named, so triage's gate isn't met even though the action is consequential.",
+        )
+
+    def test_flagged_screener_result_is_returned_and_no_downstream_stage_runs(self) -> None:
+        fake_screener = lambda text: MLScreeningResult(  # noqa: E731
+            flagged=True, probability=0.94, threshold=0.17, model_version="test-fixture"
+        )
+
+        result = investigate(
+            self._NO_ORG_MESSAGE,
+            triage_agent=FakeStructuredAgent(self._triage_declined()),
+            ml_screener=fake_screener,
+        )
+
+        self.assertFalse(result["investigated"])
+        self.assertIsNone(result["card"])
+        self.assertIsNotNone(result["ml_screening"])
+        self.assertTrue(result["ml_screening"].flagged)
+        self.assertEqual(result["ml_screening"].probability, 0.94)
+
+    def test_flagged_screening_produces_advisory_not_none(self) -> None:
+        ml_screening = MLScreeningResult(
+            flagged=True, probability=0.94, threshold=0.17, model_version="test-fixture"
+        )
+        channel = decide(self._triage_declined(), None, ml_screening)
+        self.assertEqual(channel.value, "advisory")
+
+    def test_unflagged_screening_still_suppresses(self) -> None:
+        ml_screening = MLScreeningResult(
+            flagged=False, probability=0.03, threshold=0.17, model_version="test-fixture"
+        )
+        channel = decide(self._triage_declined(), None, ml_screening)
+        self.assertEqual(channel.value, "none")
+
+    def test_investigated_case_ignores_ml_screening_even_if_flagged(self) -> None:
+        """ml_screening only matters on the un-investigated path -- an
+        investigated case's channel comes entirely from the card, by design
+        (see notify.decide's rule table)."""
+        triage = TriageResult(
+            warrants_investigation=True,
+            claimed_organization="Canada Post",
+            requested_action=RequestedAction.MAKE_PAYMENT,
+            urgency_signals=[],
+            visible_hostname=None,
+            reasoning="test fixture",
+        )
+        card = EvidenceCard(
+            verdict=Verdict.NO_CONTRADICTION_FOUND,
+            risk_level=RiskLevel.QUIET,
+            headline="No contradiction found.",
+            claimed_identity="Canada Post",
+            requested_action=RequestedAction.MAKE_PAYMENT,
+            observed_behaviour=[],
+            verified_facts=[],
+            inferences=[],
+            unresolved=[],
+            claim_assessments=[],
+            evidence=[],
+            safe_next_action="Check the official app.",
+        )
+        # A flagged ml_screening would never actually be produced alongside an
+        # investigated case in practice (agent.py only screens the declined
+        # path) -- this proves decide() doesn't accidentally let it leak
+        # through anyway if it were.
+        ml_screening = MLScreeningResult(
+            flagged=True, probability=0.99, threshold=0.17, model_version="test-fixture"
+        )
+        channel = decide(triage, card, ml_screening)
+        self.assertEqual(channel.value, "standard")
 
 
 class TestFullChainThroughPersistenceAndNotification(unittest.TestCase):

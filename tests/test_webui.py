@@ -19,9 +19,10 @@ import urllib.request
 from unittest import mock
 
 from smishsentinel.notify import decide, deliver
-from smishsentinel.schemas import RequestedAction, RiskLevel, TriageResult
+from smishsentinel.schemas import MLScreeningResult, RequestedAction, RiskLevel, TriageResult
 from smishsentinel.store import CaseRecord, CaseStatus, CaseStore, new_case_id
 from smishsentinel.webui import (
+    _channel_badge,
     case_summary,
     make_app,
     recent_case_summaries,
@@ -88,6 +89,21 @@ def _quiet_record() -> CaseRecord:
     return record
 
 
+def _advisory_record() -> CaseRecord:
+    record = CaseRecord(
+        case_id=new_case_id(),
+        received_at="2026-08-20T12:00:00+00:00",
+        status=CaseStatus.COMPLETE,
+        message_text="You have WON a guaranteed cash prize! Call 09051234567 now to claim.",
+    )
+    triage = _triage(False)
+    ml_screening = MLScreeningResult(flagged=True, probability=0.91, threshold=0.17, model_version="test-fixture")
+    record.triage = triage.model_dump(mode="json")
+    record.ml_screening = ml_screening.model_dump(mode="json")
+    record.notification = deliver(record, decide(triage, None, ml_screening))
+    return record
+
+
 class TestCaseSummary(unittest.TestCase):
     def test_investigated_case_summary_carries_headline_and_channel(self) -> None:
         summary = case_summary(_investigated_record())
@@ -109,6 +125,19 @@ class TestCaseSummary(unittest.TestCase):
         summary = case_summary(record)
         self.assertEqual(summary["status"], "failed")
         self.assertIn("boom", summary["error"])
+
+    def test_advisory_case_summary_is_not_investigated_but_channel_is_advisory(self) -> None:
+        """The one combination the badge logic has to get right: investigated
+        is False (triage's gate wasn't met) yet the channel isn't the plain
+        quiet default, because the ML screener flagged it."""
+        summary = case_summary(_advisory_record())
+        self.assertFalse(summary["investigated"])
+        self.assertEqual(summary["channel"], "advisory")
+
+    def test_advisory_channel_badge_overrides_the_not_investigated_default(self) -> None:
+        css_class, label = _channel_badge({"status": "complete", "investigated": False, "channel": "advisory"})
+        self.assertEqual(css_class, "advisory")
+        self.assertIn("Advisory", label)
 
 
 class TestRendering(unittest.TestCase):
@@ -133,6 +162,12 @@ class TestRendering(unittest.TestCase):
     def test_case_page_for_quiet_case_says_no_investigation(self) -> None:
         page = render_case_page(_quiet_record())
         self.assertIn("did not warrant investigation", page)
+
+    def test_case_page_for_advisory_case_shows_the_screening_probability_not_a_verdict(self) -> None:
+        page = render_case_page(_advisory_record())
+        self.assertIn("91%", page)
+        self.assertIn("not an investigation", page)
+        self.assertNotIn("did not warrant investigation and was left quiet", page)
 
     def test_message_text_is_escaped_not_interpolated_raw(self) -> None:
         """A message containing HTML-significant characters must not be

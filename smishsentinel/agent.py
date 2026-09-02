@@ -14,6 +14,13 @@ Between the investigator and the card the pipeline runs a deterministic
 citation check: any evidence ID the model cites that was not actually fetched
 is stripped, and a verdict resting on stripped evidence is downgraded to
 insufficient evidence. The model proposes; the ledger disposes.
+
+A message that fails triage's gate takes a fifth, much narrower path instead
+of ending there unconditionally: ml_screen.py's trained classifier, a
+statistical check for scam phrasing that needs no named organization to run
+against. It cannot produce a verdict or cite anything, so a positive result
+only ever reaches NotificationChannel.ADVISORY (see notify.py) -- a
+categorically weaker signal than an investigated case, never mistaken for one.
 """
 
 from __future__ import annotations
@@ -33,8 +40,9 @@ from .config import (
     TRIAGE_BUDGET,
     TRIAGE_MODEL,
 )
+from .ml_screen import screen as ml_screen
 from .safety import wrap_untrusted
-from .schemas import ClaimSet, ClaimStatus, EvidenceCard, RiskLevel, TriageResult, Verdict
+from .schemas import ClaimSet, ClaimStatus, EvidenceCard, MLScreeningResult, RiskLevel, TriageResult, Verdict
 from .tools.evidence import (
     compare_hostname_to_domain,
     current_context,
@@ -579,11 +587,13 @@ def investigate(
     claim_agent: object | None = None,
     investigator_agent: object | None = None,
     synthesis_agent: object | None = None,
+    ml_screener: object | None = None,
 ) -> dict:
     """Run one message through the full pipeline.
 
-    Returns a dict with ``investigated`` (bool) and either ``triage`` alone,
-    when the message did not warrant investigation, or ``triage`` plus ``card``.
+    Returns a dict with ``investigated`` (bool), ``triage``, ``card`` (``None``
+    unless investigated), and ``ml_screening`` (``None`` unless the message
+    failed triage's gate and was screened -- see ml_screen.py).
 
     The message is wrapped as untrusted content at every stage that sees it, so
     an instruction embedded in the message reads as data rather than as part of
@@ -598,7 +608,10 @@ def investigate(
     tested in isolation. Each substitute only needs to satisfy the call shape
     used below (callable with a prompt and, where applicable,
     ``structured_output_model``/``limits`` keywords), not be a real
-    ``strands.Agent``.
+    ``strands.Agent``. ``ml_screener`` is the same kind of seam for
+    ml_screen.screen -- a callable taking the message text and returning an
+    MLScreeningResult -- so tests can exercise the advisory path without
+    loading the real trained artifact.
     """
     context = reset_context()
     wrapped = wrap_untrusted(message_text, source="user_submitted_message")
@@ -616,7 +629,19 @@ def investigate(
               f"org={triage.claimed_organization} action={triage.requested_action.value}")
 
     if not triage.warrants_investigation:
-        return {"investigated": False, "triage": triage, "card": None}
+        screener = ml_screener or ml_screen
+        ml_screening: MLScreeningResult = screener(message_text)
+
+        if verbose:
+            print(f"[ml_screen] flagged={ml_screening.flagged} "
+                  f"probability={ml_screening.probability:.3f} threshold={ml_screening.threshold:.3f}")
+
+        return {
+            "investigated": False,
+            "triage": triage,
+            "card": None,
+            "ml_screening": ml_screening,
+        }
 
     claim_agent = claim_agent or build_claim_agent()
     claim_result = claim_agent(
@@ -674,4 +699,4 @@ ACTUAL RETRIEVED PAGE TEXT (quote from here, never from the notes above):
     card: EvidenceCard = card_result.structured_output
     card = _enforce_citations(card)
 
-    return {"investigated": True, "triage": triage, "card": card}
+    return {"investigated": True, "triage": triage, "card": card, "ml_screening": None}

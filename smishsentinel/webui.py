@@ -62,9 +62,11 @@ _STATUS_LABEL = {
 
 # channel value -> (css class, human label). NONE is the quiet, common case
 # by design (see agent.py's triage prompt) -- it should read as unremarkable,
-# not as an error state.
+# not as an error state. ADVISORY is deliberately its own class, not reused
+# from standard/urgent -- it's a statistical flag, not an investigated case.
 _CHANNEL_META = {
     "none": ("quiet", "Quiet — no investigation warranted"),
+    "advisory": ("advisory", "Advisory — pattern match, not investigated"),
     "standard": ("standard", "Standard"),
     "urgent": ("urgent", "Urgent"),
 }
@@ -139,7 +141,7 @@ _CSS = """
   color-scheme: light dark;
   --bg: #0f1216; --panel: #171b21; --border: #2a2f38; --text: #e6e9ee;
   --muted: #8b93a1; --accent: #4f8cff;
-  --quiet: #5b6472; --standard: #4f8cff; --urgent: #e5484d;
+  --quiet: #5b6472; --standard: #4f8cff; --urgent: #e5484d; --advisory: #c9a53a;
   --high: #e5484d; --elevated: #e08a3c; --unclear: #c9a53a; --lowrisk: #5b6472;
 }
 * { box-sizing: border-box; }
@@ -172,6 +174,7 @@ a { color: var(--accent); }
   font-weight: 600; text-transform: uppercase; letter-spacing: 0.02em;
 }
 .badge.quiet { background: color-mix(in srgb, var(--quiet) 30%, transparent); color: var(--muted); }
+.badge.advisory { background: color-mix(in srgb, var(--advisory) 25%, transparent); color: var(--advisory); }
 .badge.standard { background: color-mix(in srgb, var(--standard) 25%, transparent); color: var(--standard); }
 .badge.urgent { background: color-mix(in srgb, var(--urgent) 25%, transparent); color: var(--urgent); }
 .badge.status { background: var(--panel); color: var(--muted); border: 1px solid var(--border); }
@@ -217,9 +220,17 @@ ul.evidence-list li:first-child { border-top: none; }
 def _channel_badge(case: dict) -> tuple[str, str]:
     """(css class, label) for the channel badge -- a failed case reads as
     "investigation failed", not the misleading "not investigated" a crash
-    would otherwise share with a message triage genuinely stayed quiet on."""
+    would otherwise share with a message triage genuinely stayed quiet on.
+
+    A case can be un-investigated and still not the plain quiet default: the
+    ML screener (see ml_screen.py) may have flagged it, which shows up here
+    as channel="advisory" despite investigated=False -- checked before the
+    investigated branch below, not folded into it, since advisory cases
+    never carry a card."""
     if case["status"] == "failed":
         return "urgent", "Investigation failed"
+    if case["channel"] == "advisory":
+        return _CHANNEL_META["advisory"]
     if case["investigated"]:
         return _CHANNEL_META.get(case["channel"], ("quiet", "—"))
     return "quiet", "Not investigated"
@@ -316,6 +327,7 @@ async function poll() {{
 }}
 const CHANNEL_META = {{
   none: ['quiet', 'Quiet — no investigation warranted'],
+  advisory: ['advisory', 'Advisory — pattern match, not investigated'],
   standard: ['standard', 'Standard'],
   urgent: ['urgent', 'Urgent'],
 }};
@@ -325,6 +337,7 @@ function esc(s) {{
 }}
 function channelBadge(c) {{
   if (c.status === 'failed') return ['urgent', 'Investigation failed'];
+  if (c.channel === 'advisory') return CHANNEL_META.advisory;
   if (c.investigated) return CHANNEL_META[c.channel] || ['quiet', '—'];
   return ['quiet', 'Not investigated'];
 }}
@@ -393,6 +406,15 @@ def render_case_page(record: CaseRecord) -> str:
   <div class="section-label">Investigation failed</div>
   <p>{html.escape(record.error or 'Unknown error.')}</p>
   <p class="msg-preview">A failure still produces a notification — see notify.py's design note on why silence on failure would be worse than a wrong verdict.</p>
+</div>"""
+    elif record.ml_screening and record.ml_screening.get("flagged"):
+        probability = record.ml_screening.get("probability", 0.0)
+        body_extra = f"""<div class="card">
+  <div class="section-label">Triage</div>
+  <p class="msg-preview">This message did not name an identifiable organization and a consequential action together, so it was not investigated.</p>
+  <div class="section-label">Statistical pattern check</div>
+  <span class="risk-pill" style="background:color-mix(in srgb, var(--advisory) 25%, transparent);color:var(--advisory);">flagged &middot; probability {probability:.0%}</span>
+  <p class="msg-preview">A trained classifier flagged this text as resembling known spam/smishing patterns. This is a lexical match, not an investigation — no organization was checked, no evidence was gathered, and there is no verdict here to act on beyond ordinary caution.</p>
 </div>"""
     elif not record.card:
         body_extra = """<div class="card">

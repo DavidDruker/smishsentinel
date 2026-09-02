@@ -16,7 +16,7 @@ from unittest import mock
 
 from smishsentinel.inbox import investigate_one_message, run_inbox_cycle
 from smishsentinel.notify import decide, deliver, verify_delivered, verify_notification_sent
-from smishsentinel.schemas import RequestedAction, RiskLevel, TriageResult, Verdict
+from smishsentinel.schemas import MLScreeningResult, RequestedAction, RiskLevel, TriageResult, Verdict
 from smishsentinel.store import CaseRecord, CaseStatus, CaseStore, NotificationChannel, new_case_id
 
 
@@ -97,6 +97,14 @@ class TestCaseStore(unittest.TestCase):
 class TestNotifyPolicy(unittest.TestCase):
     def test_suppresses_when_no_investigation_warranted(self) -> None:
         self.assertEqual(decide(_triage(False), None), NotificationChannel.NONE)
+
+    def test_suppresses_when_ml_screening_present_but_not_flagged(self) -> None:
+        ml_screening = MLScreeningResult(flagged=False, probability=0.02, threshold=0.17, model_version="v")
+        self.assertEqual(decide(_triage(False), None, ml_screening), NotificationChannel.NONE)
+
+    def test_advisory_when_ml_screening_flagged(self) -> None:
+        ml_screening = MLScreeningResult(flagged=True, probability=0.88, threshold=0.17, model_version="v")
+        self.assertEqual(decide(_triage(False), None, ml_screening), NotificationChannel.ADVISORY)
 
     def test_urgent_when_card_missing_despite_investigation(self) -> None:
         """Defensive default: an investigated case with no card is a gap in
@@ -204,6 +212,40 @@ class TestInvestigateOneMessage(unittest.TestCase):
 
         self.assertEqual(record.case_id, "case-fixed-id")
         self.assertIsNotNone(self.store.get("case-fixed-id"))
+
+    def test_flagged_ml_screening_persists_and_notifies_as_advisory(self) -> None:
+        """The fifth path end to end through real persistence: a declined
+        triage plus a flagged ml_screening (investigate() is mocked here, the
+        same way every other test in this file mocks it -- the real wiring
+        inside investigate() is tests/test_deterministic_eval.py's job)."""
+        ml_screening = MLScreeningResult(
+            flagged=True, probability=0.91, threshold=0.17, model_version="test-fixture"
+        )
+        with mock.patch("smishsentinel.inbox.investigate") as mock_investigate:
+            mock_investigate.return_value = {
+                "investigated": False, "triage": _triage(False), "card": None,
+                "ml_screening": ml_screening,
+            }
+            record = investigate_one_message("you have won a prize, call now", self.store)
+
+        self.assertEqual(record.notification.channel, NotificationChannel.ADVISORY)
+        self.assertIsNotNone(record.ml_screening)
+        self.assertTrue(record.ml_screening["flagged"])
+        self.assertAlmostEqual(record.ml_screening["probability"], 0.91)
+        loaded = self.store.get(record.case_id)
+        self.assertEqual(loaded.notification.channel, NotificationChannel.ADVISORY)
+        self.assertTrue(loaded.notification.notification_delivered)
+
+    def test_missing_ml_screening_key_defaults_safely(self) -> None:
+        """Every other test in this file mocks investigate() with a dict that
+        has no "ml_screening" key at all (written before this path existed) --
+        investigate_one_message must keep working against those, not KeyError."""
+        with mock.patch("smishsentinel.inbox.investigate") as mock_investigate:
+            mock_investigate.return_value = {"investigated": False, "triage": _triage(False), "card": None}
+            record = investigate_one_message("hey, running late", self.store)
+
+        self.assertIsNone(record.ml_screening)
+        self.assertEqual(record.notification.channel, NotificationChannel.NONE)
 
     def test_run_inbox_cycle_and_single_message_produce_the_same_shape(self) -> None:
         """A regression guard on the refactor itself: run_inbox_cycle must

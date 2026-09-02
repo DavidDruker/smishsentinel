@@ -75,6 +75,11 @@ stage with network access) → synthesis → deterministic citation verification
 verification that delivery actually happened
 ```
 
+A message triage declines branches instead of ending unconditionally: a
+trained statistical classifier (below) gets one narrower look, and a
+positive result reaches `NotificationChannel.ADVISORY` — never the same
+channel an investigated case gets.
+
 ## Design decisions worth knowing about
 
 These aren't incidental implementation details — they're the parts of this
@@ -170,6 +175,25 @@ reasoning without archaeology.
   is that missing ceiling — once elapsed time in a cycle passes it, every
   remaining message fails without a model call rather than continuing to
   spend time and money.
+- **A message triage declines still gets one more check, of a different
+  kind.** Triage's gate requires both a named organization and a
+  consequential action, deliberately — the investigation stage that follows
+  can only verify an organization's claim against the registry, so it has
+  nothing to check when neither is present. A real category of scam text has
+  neither (a bare "you have WON, call this number", no brand claimed at
+  all). [`ml_screen.py`](smishsentinel/ml_screen.py) is a classical TF-IDF +
+  linear-SVM classifier, trained offline on labelled ham/spam/smishing text
+  and tuned to favor recall over precision, that runs only on messages
+  triage declines. It never produces a verdict or cites anything — a
+  positive result reaches `NotificationChannel.ADVISORY`, a category below
+  `STANDARD`/`URGENT` and never mistaken for an investigated case. See
+  `MLScreeningResult` in [`schemas.py`](smishsentinel/schemas.py) for why
+  that's a deliberately weaker signal than an `EvidenceCard`, and
+  [`smishsentinel/ml_models/`](smishsentinel/ml_models/) for the training
+  scripts. Training data was consolidated from third-party academic SMS
+  datasets, with duplicate and near-duplicate scam templates (bulk campaigns
+  repeat the same message with a phone number or word changed) cleaned up
+  with Claude's help before training.
 - **Persistence survives container recycling, when configured to.** The
   local JSON `CaseStore` was always documented as non-durable across
   AgentCore container recycling. `DynamoDBCaseStore` is the production swap
@@ -303,6 +327,14 @@ Stated plainly rather than left for a judge to discover:
   organizations is handled by locking the one the requested action is
   actually about and noting the other as a limitation, not by evaluating
   both.
+- The ML screener ([`ml_screen.py`](smishsentinel/ml_screen.py)) is a
+  classical bag-of-words classifier trained on a few thousand labelled
+  examples from third-party academic SMS datasets — strong against the
+  templated, lazily-varied scam text that dominates that training data, weak
+  by construction against an adversary who deliberately rewrites their
+  message to dodge a lexical fingerprint. It's also English-only. Treat it
+  as a recall-oriented pattern match on messages triage already declined to
+  investigate, not a substitute for the evidence-based pipeline above it.
 - Adversarial coverage is real but narrow: [`test_adversarial.py`](tests/test_adversarial.py)
   proves the deterministic layers (citation verification, notify policy,
   the schema's no-safe-verdict invariant) hold even against a worst-case,

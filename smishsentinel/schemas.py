@@ -117,6 +117,34 @@ class TriageResult(BaseModel):
     )
 
 
+class MLScreeningResult(BaseModel):
+    """A statistical second opinion for the messages triage lets go quiet.
+
+    Not a verdict, and never treated as one: it carries no evidence, no
+    citation, no organization it checked against anything. Triage's own gate
+    requires a named organization AND a consequential action; a lot of real
+    scam text (a bare "you have WON, call this number", no brand claimed at
+    all) fails that gate honestly, because there is nothing for the
+    investigation stage's tools to verify. This model is a lexical
+    pattern-match against known scam phrasing, run only on messages that
+    already failed the triage gate, so it can catch what that gate cannot by
+    construction rather than compete with it.
+    """
+
+    flagged: bool = Field(
+        description="Whether the message's predicted probability cleared the screening threshold."
+    )
+    probability: float = Field(
+        description="Calibrated probability the message resembles known spam/smishing patterns."
+    )
+    threshold: float = Field(
+        description="The threshold probability had to clear to be flagged, at export time."
+    )
+    model_version: str = Field(
+        description="Identifies which trained artifact produced this result, for auditability."
+    )
+
+
 # --------------------------------------------------------------------------
 # Stage 2 — claim extraction
 # --------------------------------------------------------------------------

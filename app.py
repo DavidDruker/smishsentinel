@@ -47,10 +47,12 @@ def _serialize(result: dict) -> dict:
     """Turn the pipeline's Pydantic objects into a JSON-serializable dict."""
     triage = result["triage"]
     card = result["card"]
+    ml_screening = result.get("ml_screening")
     return {
         "investigated": result["investigated"],
         "triage": triage.model_dump(mode="json") if triage else None,
         "card": card.model_dump(mode="json") if card else None,
+        "ml_screening": ml_screening.model_dump(mode="json") if ml_screening else None,
     }
 
 

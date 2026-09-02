@@ -105,11 +105,13 @@ def investigate_one_message(
 
     triage: TriageResult = result["triage"]
     card = result["card"]
+    ml_screening = result.get("ml_screening")
 
     record.triage = triage.model_dump(mode="json")
     record.card = card.model_dump(mode="json") if card else None
+    record.ml_screening = ml_screening.model_dump(mode="json") if ml_screening else None
 
-    channel = decide(triage, card)
+    channel = decide(triage, card, ml_screening)
     record.notification = deliver(record, channel)
     record.status = CaseStatus.COMPLETE
     store.save(record)

@@ -47,6 +47,7 @@ class CaseStatus(str, Enum):
 
 class NotificationChannel(str, Enum):
     NONE = "none"
+    ADVISORY = "advisory"
     STANDARD = "standard"
     URGENT = "urgent"
 
@@ -83,6 +84,7 @@ class CaseRecord:
     message_text: str
     triage: dict | None = None
     card: dict | None = None
+    ml_screening: dict | None = None
     notification: NotificationRecord | None = None
     error: str | None = None
     updated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())

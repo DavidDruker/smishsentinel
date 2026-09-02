@@ -30,7 +30,9 @@ flowchart TD
     end
 
     B -->|valid string only| D["Triage Agent<br/>(cheap model, no tools)"]
-    D -->|"warrants_investigation:<br/>false (the common case)"| E["Silent.<br/>No card, no alert."]
+    D -->|"warrants_investigation:<br/>false (the common case)"| E0["ml_screen.py: classical<br/>TF-IDF + SVM classifier<br/>(nothing named to verify,<br/>so a different kind of check)"]
+    E0 -->|not flagged| E["Silent.<br/>No card, no alert."]
+    E0 -->|flagged| E1["NotificationChannel.ADVISORY<br/>— a probability, never a verdict"]
     D -->|true| F["Claim Extraction Agent<br/>(no tools)"]
 
     F --> G["Investigator Agent<br/>(only stage with tools)"]
@@ -73,7 +75,7 @@ flowchart TD
     C2 -->|no| D["status=investigating"]
     D --> E["investigate() —<br/>the full pipeline above"]
     E -->|exception| F["status=failed, error recorded<br/>URGENT notification —<br/>a real, queryable outcome,<br/>and the user is still told"]
-    E -->|success| G["notify.decide(triage, card)<br/>— fixed rule table, not model judgment"]
+    E -->|success| G["notify.decide(triage, card,<br/>ml_screening)<br/>— fixed rule table, not model judgment"]
     G --> H["notify.deliver —<br/>durable record + log line<br/>(decision_recorded vs<br/>notification_delivered kept separate;<br/>scoped honestly: no phone in this loop)"]
     H --> I["status=complete, persisted"]
     F --> J["Independent verification:<br/>re-read the case from the store,<br/>not the in-memory return value"]
