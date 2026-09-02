@@ -89,6 +89,17 @@ warranted regardless of how mundane, official, or harmless the message \
 appears — that judgment belongs to the investigation stage, which can \
 actually verify it, not to you.
 
+The same applies to "identifiable": it means a specific name is given — \
+"Blind Date 4U", "NoWorriesLoans.com", a shortcode brand, whatever the \
+message calls itself — not that you personally recognize it as a real, \
+established company. Do not withhold investigation because a name sounds \
+informal, generic, small, or unfamiliar to you. Whether a named sender turns \
+out to be a real, verifiable organization or a shell name invented for one \
+campaign is exactly what set_official_domain and the registry decide \
+downstream — including by returning an honest "this organization isn't in \
+the registry" when it isn't real. A name you cannot personally vouch for is \
+not the same as no name at all.
+
 Ordinary messages — a delivery notice with no action, a marketing blast with \
 no named organization, a personal message, a plain notification — end here. \
 Staying silent is the correct and common outcome; do not manufacture concern \
