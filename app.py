@@ -53,6 +53,7 @@ def _serialize(result: dict) -> dict:
         "triage": triage.model_dump(mode="json") if triage else None,
         "card": card.model_dump(mode="json") if card else None,
         "ml_screening": ml_screening.model_dump(mode="json") if ml_screening else None,
+        "is_phishing": result["is_phishing"],
     }
 
 

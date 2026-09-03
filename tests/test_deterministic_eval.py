@@ -168,6 +168,7 @@ class TestDeterministicEndToEnd(unittest.TestCase):
         self.assertEqual(result["card"].verdict, Verdict.OFFICIAL_CONTRADICTION)
         self.assertEqual(len(result["card"].evidence), 1)
         self.mock_fetch.assert_called_once_with(_FRAUD_PAGE_URL)
+        self.assertTrue(result["is_phishing"])
 
     def test_fabricated_citation_is_caught_inside_the_real_pipeline(self) -> None:
         """Same wiring, except synthesis fabricates a quote that was never
@@ -275,6 +276,10 @@ class TestDeterministicEndToEnd(unittest.TestCase):
         self.assertEqual(result["card"].verdict, Verdict.INSUFFICIENT_EVIDENCE)
         self.assertEqual(result["card"].evidence, [])
         self.mock_fetch.assert_not_called()
+        # is_phishing reflects that triage warranted a look, not the card's
+        # eventual verdict -- deliberately unaffected by whether the
+        # investigation could confirm or rule anything out.
+        self.assertTrue(result["is_phishing"])
 
 
 class TestMLScreeningPath(unittest.TestCase):
@@ -313,6 +318,20 @@ class TestMLScreeningPath(unittest.TestCase):
         self.assertIsNotNone(result["ml_screening"])
         self.assertTrue(result["ml_screening"].flagged)
         self.assertEqual(result["ml_screening"].probability, 0.94)
+        self.assertTrue(result["is_phishing"])
+
+    def test_unflagged_screener_result_gives_is_phishing_false(self) -> None:
+        fake_screener = lambda text: MLScreeningResult(  # noqa: E731
+            flagged=False, probability=0.02, threshold=0.17, model_version="test-fixture"
+        )
+
+        result = investigate(
+            "Hey are we still meeting for coffee at 10 tomorrow?",
+            triage_agent=FakeStructuredAgent(self._triage_declined()),
+            ml_screener=fake_screener,
+        )
+
+        self.assertFalse(result["is_phishing"])
 
     def test_flagged_screening_produces_advisory_not_none(self) -> None:
         ml_screening = MLScreeningResult(

@@ -592,8 +592,17 @@ def investigate(
     """Run one message through the full pipeline.
 
     Returns a dict with ``investigated`` (bool), ``triage``, ``card`` (``None``
-    unless investigated), and ``ml_screening`` (``None`` unless the message
-    failed triage's gate and was screened -- see ml_screen.py).
+    unless investigated), ``ml_screening`` (``None`` unless the message
+    failed triage's gate and was screened -- see ml_screen.py), and
+    ``is_phishing`` (bool) -- one deterministic yes/no answer, always equal
+    to ``triage.warrants_investigation or (ml_screening is not None and
+    ml_screening.flagged)``, regardless of which stage produced it. This is
+    the field a caller who doesn't care about SmishSentinel's internal
+    architecture should read: it never depends on the card's verdict, which
+    is the only non-deterministic part of the pipeline (investigation and
+    synthesis run at temperature > 0, so the same message could produce a
+    different verdict on a different run -- triage and the classifier do
+    not have that problem, so the yes/no answer is built only from them).
 
     The message is wrapped as untrusted content at every stage that sees it, so
     an instruction embedded in the message reads as data rather than as part of
@@ -641,6 +650,7 @@ def investigate(
             "triage": triage,
             "card": None,
             "ml_screening": ml_screening,
+            "is_phishing": ml_screening.flagged,
         }
 
     claim_agent = claim_agent or build_claim_agent()
@@ -699,4 +709,4 @@ ACTUAL RETRIEVED PAGE TEXT (quote from here, never from the notes above):
     card: EvidenceCard = card_result.structured_output
     card = _enforce_citations(card)
 
-    return {"investigated": True, "triage": triage, "card": card, "ml_screening": None}
+    return {"investigated": True, "triage": triage, "card": card, "ml_screening": None, "is_phishing": True}
