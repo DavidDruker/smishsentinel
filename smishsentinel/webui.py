@@ -44,7 +44,7 @@ from urllib.parse import urlparse
 
 from .inbox import investigate_one_message, run_inbox_cycle
 from .schemas import RiskLevel
-from .store import CaseRecord, CaseStatus, CaseStore, DynamoDBCaseStore, get_case_store, new_case_id
+from .store import CaseRecord, CaseStatus, CaseStore, new_case_id
 
 _HOST = "127.0.0.1"
 _DEFAULT_PORT = int(os.environ.get("SMISH_WEBUI_PORT", "8090"))
@@ -107,7 +107,7 @@ def case_summary(record: CaseRecord) -> dict:
     }
 
 
-def recent_case_summaries(store: CaseStore | DynamoDBCaseStore, limit: int = 50) -> list[dict]:
+def recent_case_summaries(store: CaseStore, limit: int = 50) -> list[dict]:
     return [case_summary(r) for r in store.list_recent(limit=limit)]
 
 
@@ -491,7 +491,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib method name
         path = urlparse(self.path).path
-        store: CaseStore | DynamoDBCaseStore = self.server.store  # type: ignore[attr-defined]
+        store: CaseStore = self.server.store  # type: ignore[attr-defined]
 
         if path == "/":
             self._send_html(200, render_inbox_page(recent_case_summaries(store)))
@@ -519,7 +519,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib method name
         path = urlparse(self.path).path
-        store: CaseStore | DynamoDBCaseStore = self.server.store  # type: ignore[attr-defined]
+        store: CaseStore = self.server.store  # type: ignore[attr-defined]
 
         if path == "/run-cycle":
             # Fire-and-forget in a background thread: run_inbox_cycle persists
@@ -574,14 +574,12 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class _Server(ThreadingHTTPServer):
-    store: CaseStore | DynamoDBCaseStore
+    store: CaseStore
 
 
-def make_app(
-    store: CaseStore | DynamoDBCaseStore | None = None, port: int = _DEFAULT_PORT
-) -> _Server:
+def make_app(store: CaseStore | None = None, port: int = _DEFAULT_PORT) -> _Server:
     server = _Server((_HOST, port), _Handler)
-    server.store = store or get_case_store()
+    server.store = store or CaseStore()
     return server
 
 

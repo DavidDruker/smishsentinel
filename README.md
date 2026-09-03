@@ -176,34 +176,13 @@ reasoning without archaeology.
   remaining message fails without a model call rather than continuing to
   spend time and money.
 - **A message triage declines still gets one more check, of a different
-  kind.** Triage's gate requires both a named organization and a
-  consequential action, deliberately — the investigation stage that follows
-  can only verify an organization's claim against the registry, so it has
-  nothing to check when neither is present. A real category of scam text has
-  neither (a bare "you have WON, call this number", no brand claimed at
-  all). [`ml_screen.py`](smishsentinel/ml_screen.py) is a classical TF-IDF +
-  linear-SVM classifier, trained offline on labelled ham/spam/smishing text
-  and tuned to favor recall over precision, that runs only on messages
-  triage declines. It never produces a verdict or cites anything — a
-  positive result reaches `NotificationChannel.ADVISORY`, a category below
-  `STANDARD`/`URGENT` and never mistaken for an investigated case. See
-  `MLScreeningResult` in [`schemas.py`](smishsentinel/schemas.py) for why
-  that's a deliberately weaker signal than an `EvidenceCard`, and
-  [`smishsentinel/ml_models/`](smishsentinel/ml_models/) for the training
-  scripts. Training data was consolidated from third-party academic SMS
-  datasets, with duplicate and near-duplicate scam templates (bulk campaigns
-  repeat the same message with a phone number or word changed) cleaned up
-  with Claude's help before training.
-- **Persistence survives container recycling, when configured to.** The
-  local JSON `CaseStore` was always documented as non-durable across
-  AgentCore container recycling. `DynamoDBCaseStore` is the production swap
-  the store/notify interfaces were built to allow — same `save`/`get`/
-  `list_recent` contract, so `inbox.py`, `app.py`, and `webui.py` never need
-  to know which backend is active. `get_case_store()` picks DynamoDB when
-  `SMISH_CASE_TABLE` is set and the local JSON store otherwise (every
-  offline test, and local development without a table). See
-  [`store.py`](smishsentinel/store.py) and "Optional: durable persistence
-  with DynamoDB" below for setup.
+  kind.** [`ml_screen.py`](smishsentinel/ml_screen.py) is a trained
+  classifier that runs only on messages with no named organization for the
+  investigation stage to verify. It never produces a verdict — a positive
+  result reaches `NotificationChannel.ADVISORY`, structurally distinct from
+  an investigated case. Full model details, training data, and licensing:
+  [`docs/model-card.md`](docs/model-card.md). Evaluation results:
+  [`docs/evaluation.md`](docs/evaluation.md).
 
 ## Running it
 
@@ -248,36 +227,6 @@ agentcore deploy   # builds ARM64 via CodeBuild -- no local Docker needed
 agentcore invoke '{"text": "..."}'
 ```
 
-**Optional: durable persistence with DynamoDB.** By default this runs with
-the local JSON `CaseStore` (zero setup, but doesn't survive AgentCore
-container recycling). To switch to `DynamoDBCaseStore` instead:
-
-```bash
-# 1. Create the table (on-demand billing, no capacity planning needed for this scale)
-aws dynamodb create-table \
-  --table-name smishsentinel-cases \
-  --attribute-definitions AttributeName=case_id,AttributeType=S \
-  --key-schema AttributeName=case_id,KeyType=HASH \
-  --billing-mode PAY_PER_REQUEST \
-  --region us-east-1
-
-# 2. Grant the deployed agent's execution role access to it -- the
-#    auto-created role does NOT include this by default (Bedrock + logs +
-#    X-Ray + ECR only). Fill in the placeholders in the policy file first.
-aws iam put-role-policy \
-  --role-name AmazonBedrockAgentCoreSDKRuntime-us-east-1-<your-hash> \
-  --policy-name SmishSentinelCaseTableAccess \
-  --policy-document file://docs/agentcore-execution-role-dynamodb-policy.json
-
-# 3. Set the table name as an env var on the deployed agent and redeploy
-agentcore deploy --env SMISH_CASE_TABLE=smishsentinel-cases
-```
-
-Locally, `SMISH_CASE_TABLE=smishsentinel-cases python app.py` switches the
-same way (your own AWS credentials need equivalent DynamoDB permissions on
-that table). Unset it, or don't set it at all, to keep using the JSON store
-— that's what every offline test and `webui.py`'s local demo do.
-
 ## Repository layout
 
 ```
@@ -287,17 +236,21 @@ smishsentinel/
   schemas.py                    Structured contracts -- see the verdict taxonomy and why
   safety.py                     SSRF guard (peer-IP validated, not just DNS-checked), redaction
   registry.py                   Curated organization -> official-domain registry
-  store.py                      Case persistence -- local JSON store or DynamoDB, same interface
+  store.py                      Case persistence -- local JSON store
   notify.py                     Deterministic notify/suppress policy, delivery, verification
   inbox.py                      The synthetic inbox trigger and end-to-end orchestration
   webui.py                      Local demo UI: inbox -> evidence card -> safe action (stdlib-only)
+  ml_screen.py                  The trained classifier for messages triage declines
+  ml_models/                    The trained artifact, and the scripts that produced it
   tools/evidence.py             Fetch, hostname comparison, and the domain-lock enforcement
 data/organizations.json         The registry's data: ~15 curated organizations and their domains
 tests/                          137 tests; everything except the live-only smoke test runs offline
   fakes.py                      Injectable fake agents + recorded page fixtures, not a test file itself
 ARCHITECTURE.md                 Diagrams and the reasoning behind the agent/tool split
-docs/agentcore-iam-bootstrap-policy.json           IAM policy for the deploying user (auto-role-creation)
-docs/agentcore-execution-role-dynamodb-policy.json IAM policy for the deployed agent's own DynamoDB access
+docs/model-card.md              The ML screener: training data, licensing, threshold, limitations
+docs/evaluation.md              Evaluation history and what is/isn't established by it
+docs/disclosures.md             AI-assistance disclosure and relationship to prior research
+docs/agentcore-iam-bootstrap-policy.json  IAM policy for the deploying user (auto-role-creation)
 .github/workflows/tests.yml     CI: installs pinned dependencies, runs the offline suite on push/PR
 ```
 
@@ -314,27 +267,18 @@ Stated plainly rather than left for a judge to discover:
   advance — not a general-purpose entity-resolution system. See
   [`registry.py`](smishsentinel/registry.py) and
   [`data/organizations.json`](data/organizations.json).
-- Case persistence defaults to a local JSON-file store — zero setup, but not
-  durable across AgentCore container recycling. `DynamoDBCaseStore` is the
-  durable alternative and is fully implemented ([`store.py`](smishsentinel/store.py)),
-  but it's opt-in (`SMISH_CASE_TABLE`) because it needs a real table and an
-  execution-role permission grant this repo can't create on your behalf —
-  see "Optional: durable persistence with DynamoDB" above.
-  `DynamoDBCaseStore.list_recent` does a full table Scan and sorts
-  client-side rather than requiring a GSI on `updated_at`; fine at this
-  submission's scale, not how you'd do it at production scale.
+- Case persistence is a local JSON-file store — zero setup, but not durable
+  across AgentCore container recycling. Accepted as a tradeoff at this
+  submission's scale rather than worked around; see [`store.py`](smishsentinel/store.py).
 - One organization per case. A message plausibly involving two unrelated
   organizations is handled by locking the one the requested action is
   actually about and noting the other as a limitation, not by evaluating
   both.
-- The ML screener ([`ml_screen.py`](smishsentinel/ml_screen.py)) is a
-  classical bag-of-words classifier trained on a few thousand labelled
-  examples from third-party academic SMS datasets — strong against the
-  templated, lazily-varied scam text that dominates that training data, weak
-  by construction against an adversary who deliberately rewrites their
-  message to dodge a lexical fingerprint. It's also English-only. Treat it
-  as a recall-oriented pattern match on messages triage already declined to
-  investigate, not a substitute for the evidence-based pipeline above it.
+- The ML screener is a recall-oriented pattern match on messages triage
+  already declined to investigate, not a substitute for the evidence-based
+  pipeline above it. Full limitations (training-data provenance, a measured
+  template-overlap caveat on its evaluated recall gain, adversarial
+  robustness, English-only): [`docs/model-card.md`](docs/model-card.md).
 - Adversarial coverage is real but narrow: [`test_adversarial.py`](tests/test_adversarial.py)
   proves the deterministic layers (citation verification, notify policy,
   the schema's no-safe-verdict invariant) hold even against a worst-case,
@@ -343,14 +287,10 @@ Stated plainly rather than left for a judge to discover:
   untrusted-content wrapping) are each tested directly. This is not
   systematic red-teaming or a jailbreak corpus against the live model.
 
-## Development note
+## Disclosures
 
-Built during the hackathon submission period using Claude Code as an AI
-coding assistant throughout — the pipeline, tools, tests, documentation, and
-deployment configuration were all written fresh for this submission, not
-adapted from a pre-existing project. Third-party dependencies (the Strands
-Agents SDK, boto3, Bedrock/AgentCore, pydantic, starlette) are standard
-tools, not incorporated prior work.
+AI-assistance disclosure and this project's relationship to the author's
+separate prior research: [`docs/disclosures.md`](docs/disclosures.md).
 
 ## License
 

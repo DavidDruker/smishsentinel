@@ -27,15 +27,7 @@ from .agent import investigate
 from .config import INBOX_CYCLE_DEADLINE_SECONDS
 from .notify import decide, deliver
 from .schemas import TriageResult
-from .store import (
-    CaseRecord,
-    CaseStatus,
-    CaseStore,
-    DynamoDBCaseStore,
-    NotificationChannel,
-    get_case_store,
-    new_case_id,
-)
+from .store import CaseRecord, CaseStatus, CaseStore, NotificationChannel, new_case_id
 
 SYNTHETIC_INBOX: list[str] = [
     # Ordinary, no claimed organization, no consequential action -- the
@@ -64,7 +56,7 @@ SYNTHETIC_INBOX: list[str] = [
 
 def investigate_one_message(
     message: str,
-    store: CaseStore | DynamoDBCaseStore,
+    store: CaseStore,
     *,
     case_id: str | None = None,
 ) -> CaseRecord:
@@ -120,7 +112,7 @@ def investigate_one_message(
 
 def run_inbox_cycle(
     messages: list[str] | None = None,
-    store: CaseStore | DynamoDBCaseStore | None = None,
+    store: CaseStore | None = None,
     *,
     deadline_seconds: float = INBOX_CYCLE_DEADLINE_SECONDS,
 ) -> list[CaseRecord]:
@@ -140,7 +132,7 @@ def run_inbox_cycle(
     ever calling the model, with a real, persisted, notified record -- not
     silently dropped and not run anyway.
     """
-    store = store or get_case_store()
+    store = store or CaseStore()
     records: list[CaseRecord] = []
     start = time.monotonic()
 

@@ -18,7 +18,7 @@ from starlette.exceptions import HTTPException
 from smishsentinel.agent import investigate
 from smishsentinel.inbox import run_inbox_cycle
 from smishsentinel.notify import verify_delivered, verify_notification_sent
-from smishsentinel.store import get_case_store
+from smishsentinel.store import CaseStore
 
 app = BedrockAgentCoreApp()
 
@@ -83,7 +83,7 @@ def _run_inbox_demo() -> dict:
     to confirm the persisted state actually says what the pipeline claims,
     not just that the pipeline claims it.
     """
-    store = get_case_store()
+    store = CaseStore()
     records = run_inbox_cycle(store=store)
     return {
         "action": "run_inbox_cycle",

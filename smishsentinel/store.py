@@ -6,21 +6,12 @@ lifecycle: received, investigating, a terminal outcome, and (when the policy
 in ``notify.py`` says so) a delivered notification that can be checked
 independently later, not just trusted because the pipeline said so.
 
-Two backends, same interface (``save`` / ``get`` / ``list_recent``), so
-nothing above this module needs to know which is active:
-
-- ``CaseStore`` — a directory of one JSON file per case. Simple, zero AWS
-  dependency, what every offline test and local run uses. Not durable across
-  AgentCore container recycling: files written inside the container are not
-  guaranteed to survive it.
-- ``DynamoDBCaseStore`` — the production swap the interface above was always
-  meant to allow. Persists independently of the container, at the cost of
-  needing a real table and an execution role permitted to use it (see
-  ``docs/agentcore-execution-role-dynamodb-policy.json`` and README's
-  "Running it").
-
-``get_case_store()`` picks between them based on whether ``SMISH_CASE_TABLE``
-is set, and is what ``inbox.py``, ``app.py``, and ``webui.py`` actually call.
+``CaseStore`` is a directory of one JSON file per case -- simple, zero AWS
+dependency beyond what the rest of the pipeline already needs, and what every
+offline test, local run, and the deployed agent all use. It is not durable
+across AgentCore container recycling: files written inside the container are
+not guaranteed to survive it. That tradeoff is accepted rather than worked
+around here -- see "Known limitations" in the README.
 """
 
 from __future__ import annotations
@@ -32,10 +23,8 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal
 from enum import Enum
 from pathlib import Path
-from typing import Any
 
 
 class CaseStatus(str, Enum):
@@ -177,95 +166,3 @@ class CaseStore:
         ]
 
 
-def _decimals_to_native(value: Any) -> Any:
-    """DynamoDB returns numbers as Decimal, not int/float -- CaseRecord has
-    no numeric fields today, but converting defensively means a stray number
-    anywhere in a nested dict (triage/card, both free-form JSON dicts from
-    Pydantic) can never silently produce a Decimal where JSON serialization
-    or an equality check expects a plain number."""
-    if isinstance(value, list):
-        return [_decimals_to_native(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _decimals_to_native(v) for k, v in value.items()}
-    if isinstance(value, Decimal):
-        return int(value) if value == value.to_integral_value() else float(value)
-    return value
-
-
-class DynamoDBCaseStore:
-    """The production persistence swap ``CaseStore``'s interface was always
-    meant to allow -- see this module's docstring. Same
-    save/get/list_recent contract; nothing above this class needs to know
-    which backend is active.
-
-    Deliberately simple at this submission's scale: ``list_recent`` does a
-    full table ``Scan`` and sorts client-side by ``updated_at`` rather than
-    requiring a GSI. That's fine for a demo inbox of a handful of cases and
-    wrong for a production-scale table -- stated here rather than left
-    implicit, the same way ``CaseStore``'s own limitations are.
-
-    The execution role this runs under needs its own DynamoDB permissions;
-    AgentCore's auto-created role does not include them by default (Bedrock,
-    logs, and X-Ray only). See
-    ``docs/agentcore-execution-role-dynamodb-policy.json``.
-    """
-
-    def __init__(
-        self,
-        table_name: str | None = None,
-        *,
-        resource: Any = None,
-        region_name: str | None = None,
-    ) -> None:
-        table_name = table_name or os.environ.get("SMISH_CASE_TABLE")
-        if not table_name:
-            raise ValueError(
-                "DynamoDBCaseStore requires a table name -- pass table_name "
-                "or set SMISH_CASE_TABLE."
-            )
-        self.table_name = table_name
-        if resource is None:
-            import boto3
-
-            resource = boto3.resource(
-                "dynamodb", region_name=region_name or os.environ.get("AWS_REGION", "us-east-1")
-            )
-        self._table = resource.Table(table_name)
-
-    def save(self, record: CaseRecord) -> None:
-        record.updated_at = datetime.now(UTC).isoformat()
-        self._table.put_item(Item=record.to_json_dict())
-
-    def get(self, case_id: str) -> CaseRecord | None:
-        response = self._table.get_item(Key={"case_id": case_id})
-        item = response.get("Item")
-        if item is None:
-            return None
-        return CaseRecord.from_json_dict(_decimals_to_native(item))
-
-    def list_recent(self, limit: int = 20) -> list[CaseRecord]:
-        items: list[dict] = []
-        response = self._table.scan()
-        items.extend(response.get("Items", []))
-        while "LastEvaluatedKey" in response:
-            response = self._table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
-            items.extend(response.get("Items", []))
-
-        items.sort(key=lambda i: i.get("updated_at", ""), reverse=True)
-        return [CaseRecord.from_json_dict(_decimals_to_native(i)) for i in items[:limit]]
-
-
-def get_case_store() -> "CaseStore | DynamoDBCaseStore":
-    """The store this process should actually use, chosen once per call
-    rather than hardcoded by any caller: ``DynamoDBCaseStore`` when
-    ``SMISH_CASE_TABLE`` is set (the real production path -- persistence
-    surviving AgentCore container recycling, which ``CaseStore`` cannot
-    offer), the local JSON ``CaseStore`` otherwise (every offline test, and
-    local development without a table). ``inbox.py``, ``app.py``, and
-    ``webui.py`` all call this rather than constructing a backend directly,
-    so the same code runs unchanged against either.
-    """
-    table_name = os.environ.get("SMISH_CASE_TABLE")
-    if table_name:
-        return DynamoDBCaseStore(table_name=table_name)
-    return CaseStore()
